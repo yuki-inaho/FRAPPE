@@ -56,6 +56,17 @@ cd "$repo_dir"
 printf '%s training completed; exporting anonymous validation images\n' \
   "$(date --iso-8601=seconds)" >> "$postprocess_log"
 
+# Keep the held-out split's aggregate quality/rate measurement alongside the
+# visual outputs.  This is intentionally done only after the training tmux
+# session has released CUDA.
+pixi run python tools/evaluate_local_checkpoint.py \
+  --checkpoint "$checkpoint" \
+  --dataset-root /workspace/data/frappe_rgb_800x608/imagefolder \
+  --splits test \
+  --channels 21 \
+  --device cuda:0 \
+  --output "${output_prefix}_test_metrics.json" >> "$postprocess_log" 2>&1
+
 # A fixed split-local index provides a prompt qualitative artifact.  The
 # representative version scores the full validation split and selects the
 # sample closest to its median PSNR without retaining a source filename.
