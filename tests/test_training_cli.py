@@ -19,6 +19,8 @@ def test_managed_options_parse() -> None:
         "--optimizer", "amuse", "--ema_decay", "0.99",
         "--min_width", "640", "--max_width", "640",
         "--validation_height", "480", "--validation_width", "640",
+        "--iterations_single", "10", "--iterations_merged", "20",
+        "--validation_every_iterations", "5",
     ])
     assert args.tensorboard is True
     assert args.keep_best_k == 3
@@ -28,6 +30,9 @@ def test_managed_options_parse() -> None:
     assert args.ema_decay == 0.99
     assert (args.min_width, args.max_width) == (640, 640)
     assert (args.validation_height, args.validation_width) == (480, 640)
+    assert args.iterations_single == [10]
+    assert args.iterations_merged == [20]
+    assert args.validation_every_iterations == 5
 
 
 def test_ps_is_still_required() -> None:

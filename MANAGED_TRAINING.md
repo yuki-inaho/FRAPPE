@@ -52,8 +52,9 @@ pixi run train-managed \
   model.decoder_ps=32 \
   model.decoder_dim=64 \
   model.decoder_arch=C \
-  'training.epochs_single=[1]' \
-  'training.epochs_merged=[1]' \
+  'training.iterations_single=[1]' \
+  'training.iterations_merged=[1]' \
+  validation.every_iterations=1 \
   training.dataset_samples=1 \
   training.validation_samples=1 \
   training.batch_size=1 \
@@ -146,34 +147,50 @@ Supported transform names are `ColorJitter`, `HueSaturationValue`, `RGBShift`,
 and `ToSepia`. Profiles live in `configs/augmentation/`; invalid transform
 names or parameters fail before the dataset/GPU training loop starts.
 
-## Epoch control
+## Iteration control and validation
 
-FRAPPE trains each progressive channel in two explicit epoch-based phases.
-Set the number of epochs per channel with lists; a shorter list repeats its
-final value for later channels:
+Managed FRAPPE training is controlled by fixed optimizer-update counts, not
+dataset epochs. Each progressive channel has a single-channel and a
+merged-decoder phase. A shorter list repeats its final value for later
+channels, so the schedule stays identical if the dataset size changes:
 
 ```bash
 pixi run train-managed \
-  'training.epochs_single=[2,2,3]' \
-  'training.epochs_merged=[4,4,5]' \
-  run.id=epoch_control_001
+  'training.iterations_single=[106,106,159]' \
+  'training.iterations_merged=[212,212,265]' \
+  validation.every_iterations=53 \
+  run.id=iteration_control_001
 ```
 
-TensorBoard records an aggregate loss for every completed phase epoch. The
-channel-level `last.pth.tar` remains the valid resume boundary because a new
-channel's encoder and merged decoder must be committed together.
+Validation/early-stopping checks occur every
+`validation.every_iterations` merged-decoder updates, plus the phase's final
+update. TensorBoard records per-update loss and validation metrics at those
+iteration numbers. `last.pth.tar` remains the valid resume boundary because a
+new channel's encoder and merged decoder must be committed together.
+
+For the real-data approximately 30-minute pilot on one channel, use:
+
+```bash
+pixi run train-managed \
+  experiment=iteration_trial_30m \
+  run.id=iteration_trial_30m_001
+```
+
+Its 200 single-channel plus 500 merged-decoder updates were calibrated from
+the measured 640×480 RTX 5090 throughput. It validates after merged iterations
+125, 250, 375, and 500 (unless early stopping ends it first).
 
 ## Early stopping
 
-Early stopping is enabled by default for the merged-decoder phase. At each
-epoch it measures PSNR on a fixed first 128-image validation subset and stops
-after two non-improving epochs (`min_delta=0.01 dB`, with at least two epochs).
-The best raw model and its EMA state are restored before full validation and
-checkpointing. It is intentionally per-channel: `last.pth.tar` still remains
-the completed-channel resume boundary.
+Early stopping is enabled by default for the merged-decoder phase. At every
+iteration-based validation check it measures PSNR on a fixed first 128-image
+validation subset and stops after two non-improving checks (`min_delta=0.01
+dB`, with at least two checks). The best raw model and its EMA state are
+restored before full validation and checkpointing. It is intentionally
+per-channel: `last.pth.tar` still remains the completed-channel resume boundary.
 
 ```bash
-pixi run train-managed early_stopping.enabled=false run.id=fixed_epochs_001
+pixi run train-managed early_stopping.enabled=false run.id=fixed_iterations_001
 pixi run train-managed early_stopping.patience=4 early_stopping.samples=256 run.id=patience_4
 ```
 

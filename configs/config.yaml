@@ -42,10 +42,10 @@ optimization:
   amuse_muon_min_ndim: 2
 
 training:
-  # Epoch counts are explicit per progressive channel. The final value repeats
-  # when the list is shorter than the channel count.
-  epochs_single: [2]
-  epochs_merged: [4]
+  # Fixed optimizer updates per progressive channel. The final value repeats
+  # when the list is shorter than the channel count, independent of dataset size.
+  iterations_single: [106]
+  iterations_merged: [212]
   # Values come from the selected model's measured GPU profile. Override for
   # smoke tests, smaller crops, or a shared GPU.
   batch_size: ${model.recommended_batch_size}
@@ -56,13 +56,18 @@ training:
   merged_decoder_noise: false
   merged_decoder_round: true
 
+validation:
+  # The merged-decoder monitor and early-stopping decision run on this update
+  # cadence rather than at DataLoader epoch boundaries.
+  every_iterations: 53
+
 checkpoint:
   keep_best_k: 3
   resume_checkpoint: null
   resume_channels: null
 
 early_stopping:
-  # Applied after merged-decoder epochs only. The final reported validation
+  # Applied after merged-decoder validation checks only. The final reported validation
   # still uses the complete validation split; this smaller fixed subset keeps
   # per-epoch model selection practical.
   enabled: true

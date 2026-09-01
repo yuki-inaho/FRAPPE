@@ -103,7 +103,26 @@ def make_amuse_optimizer(param_groups, max_lr, total_steps, config):
 
 def train_one(model, param_groups, dataloader, device, config, total_steps, epochs, label,
               lam=0.0, max_lr=1e-3, lr_pow=2, rpe=0.3, tracker=None,
-              epoch_evaluator=None, early_stopper=None):
+              epoch_evaluator=None, early_stopper=None, iterations=None,
+              validation_every_iterations=None):
+    """Train one phase, optionally stopping and validating by iteration count.
+
+    The legacy direct CLI keeps its epoch mode. Managed Hydra runs pass a
+    fixed ``iterations`` count, so changing dataset length never changes the
+    number of optimizer updates or validation cadence.
+    """
+    if iterations is not None and iterations < 1:
+        raise ValueError('iterations must be positive')
+    iteration_mode = iterations is not None
+    if iteration_mode:
+        batches_per_pass = min(len(dataloader), config.max_batches_per_epoch or len(dataloader))
+        if batches_per_pass < 1:
+            raise ValueError('iteration training needs at least one DataLoader batch')
+        epochs = int(np.ceil(iterations / batches_per_pass))
+        if (epoch_evaluator is not None
+                and (validation_every_iterations is None or validation_every_iterations < 1)):
+            raise ValueError('iteration training needs positive validation_every_iterations')
+
     def rc_sched(i_step):
         t = i_step / total_steps
         return (max_lr - config.min_lr) * (1 - (np.cos(np.pi * t)) ** (2 * lr_pow)) + config.min_lr
@@ -119,14 +138,35 @@ def train_one(model, param_groups, dataloader, device, config, total_steps, epoc
     ema = ModelEMA(model, config.ema_decay) if config.ema_decay > 0 else None
     log_mse_losses = []
     rate_losses = []
+    completed_iterations = 0
+
+    def monitor(monitor_step):
+        if config.optimizer == 'amuse':
+            optimizer.eval()
+        score = epoch_evaluator(monitor_step, model)
+        should_stop = False
+        if early_stopper is not None:
+            should_stop = early_stopper.step(score, monitor_step, model, ema)
+            if should_stop:
+                unit = 'iteration' if iteration_mode else 'epoch'
+                best = early_stopper.best_epoch if iteration_mode else early_stopper.best_epoch + 1
+                print(f"  {label} early stopping at {unit} {monitor_step}; "
+                      f"best_{unit}={best}, "
+                      f"best_psnr={early_stopper.best_score:.3f}", flush=True)
+        if config.optimizer == 'amuse' and not should_stop:
+            optimizer.train()
+        return should_stop
 
     for i_epoch in range(epochs):
         model.train()
         n_batches = len(dataloader)
         epoch_loss_start = len(log_mse_losses)
         epoch_rate_start = len(rate_losses)
+        should_stop = False
         for i_batch, x in enumerate(dataloader):
             if config.max_batches_per_epoch is not None and i_batch >= config.max_batches_per_epoch:
+                break
+            if iteration_mode and completed_iterations >= iterations:
                 break
             x = x.to(device)
             x_in = srgb_to_linear(x) if config.linear_input else x
@@ -165,34 +205,41 @@ def train_one(model, param_groups, dataloader, device, config, total_steps, epoc
                 if rate_losses:
                     tracker.scalar(f"train/{label}/rate", rate_losses[-1], step)
 
+            completed_iterations += 1
+
             if i_batch % 500 == 0:
                 avg = np.mean(log_mse_losses[-100:]) if log_mse_losses else 0
                 lr_now = optimizer.param_groups[0]['lr']
                 rate_str = f" rate={np.mean(rate_losses[-100:]):.3f}" if rate_losses else ""
-                print(f"  {label} epoch {i_epoch} batch {i_batch}/{n_batches} "
+                progress = (f"iteration {completed_iterations}/{iterations}"
+                            if iteration_mode else f"epoch {i_epoch} batch {i_batch}/{n_batches}")
+                print(f"  {label} {progress} "
                       f"log_mse={avg:.3f}{rate_str} lr={lr_now:.2e}", flush=True)
 
             del x, x_in, pred, target, log_mse_loss, total_loss
 
-        if tracker is not None and log_mse_losses:
-            tracker.scalar(f'train/{label}/epoch_log_mse', np.mean(log_mse_losses[epoch_loss_start:]), i_epoch)
-            if len(rate_losses) > epoch_rate_start:
-                tracker.scalar(f'train/{label}/epoch_rate', np.mean(rate_losses[epoch_rate_start:]), i_epoch)
-
-        should_stop = False
-        if epoch_evaluator is not None:
-            if config.optimizer == 'amuse':
-                optimizer.eval()
-            score = epoch_evaluator(i_epoch, model)
-            if early_stopper is not None:
-                should_stop = early_stopper.step(score, i_epoch, model, ema)
+            if iteration_mode and epoch_evaluator is not None and (
+                    completed_iterations % validation_every_iterations == 0
+                    or completed_iterations == iterations):
+                should_stop = monitor(completed_iterations)
                 if should_stop:
-                    print(f"  {label} early stopping at epoch {i_epoch + 1}; "
-                          f"best epoch={early_stopper.best_epoch + 1}, "
-                          f"best_psnr={early_stopper.best_score:.3f}", flush=True)
-            if config.optimizer == 'amuse' and not should_stop:
-                optimizer.train()
+                    break
+
+        if tracker is not None and log_mse_losses:
+            aggregate_name = 'iteration_log_mse' if iteration_mode else 'epoch_log_mse'
+            aggregate_step = completed_iterations if iteration_mode else i_epoch
+            tracker.scalar(f'train/{label}/{aggregate_name}',
+                           np.mean(log_mse_losses[epoch_loss_start:]), aggregate_step)
+            if len(rate_losses) > epoch_rate_start:
+                aggregate_rate = 'iteration_rate' if iteration_mode else 'epoch_rate'
+                tracker.scalar(f'train/{label}/{aggregate_rate}',
+                               np.mean(rate_losses[epoch_rate_start:]), aggregate_step)
+
+        if not iteration_mode and epoch_evaluator is not None:
+            should_stop = monitor(i_epoch)
         if should_stop:
+            break
+        if iteration_mode and completed_iterations >= iterations:
             break
 
     if config.optimizer == 'amuse':
@@ -267,6 +314,12 @@ def parse_args(argv=None):
     p.add_argument('--merged_decoder_round', type=lambda s: s.lower() in ('true','1','yes'), default=True)
     p.add_argument('--epochs_single', type=int, nargs='+', default=[2])
     p.add_argument('--epochs_merged', type=int, nargs='+', default=[4])
+    p.add_argument('--iterations_single', type=int, nargs='+', default=None,
+                   help='fixed optimizer updates per single-channel phase')
+    p.add_argument('--iterations_merged', type=int, nargs='+', default=None,
+                   help='fixed optimizer updates per merged-decoder phase')
+    p.add_argument('--validation_every_iterations', type=int, default=None,
+                   help='merged-decoder monitor cadence in optimizer updates')
     p.add_argument('--batch_size', type=int, default=1)
     p.add_argument('--min_aspect', type=float, default=1.0)
     p.add_argument('--max_aspect', type=float, default=1.0)
@@ -352,6 +405,13 @@ def main(argv=None):
         raise ValueError('amuse_muon_min_ndim must be at least 2')
     if args.early_stopping and args.early_stopping_samples < 1:
         raise ValueError('early_stopping_samples must be positive when enabled')
+    if (args.iterations_single is None) != (args.iterations_merged is None):
+        raise ValueError('iterations_single and iterations_merged must be supplied together')
+    if args.iterations_merged is not None:
+        if any(value < 1 for value in args.iterations_single + args.iterations_merged):
+            raise ValueError('iteration counts must be positive')
+        if args.validation_every_iterations is None or args.validation_every_iterations < 1:
+            raise ValueError('iteration training needs positive validation_every_iterations')
     if (args.min_width is None) != (args.max_width is None):
         raise ValueError('min_width and max_width must be supplied together')
     if (args.validation_height is None) != (args.validation_width is None):
@@ -392,6 +452,10 @@ def main(argv=None):
         if len(lst) < n_channels:
             lst = lst + [lst[-1]] * (n_channels - len(lst))
             setattr(config, attr, lst)
+    for attr in ('iterations_single', 'iterations_merged'):
+        lst = getattr(config, attr)
+        if lst is not None and len(lst) < n_channels:
+            setattr(config, attr, lst + [lst[-1]] * (n_channels - len(lst)))
 
     config.decoder_ps = args.decoder_ps or max(config.ps)
     assert all(ps % config.decoder_ps == 0 or config.decoder_ps % ps == 0
@@ -456,8 +520,13 @@ def main(argv=None):
     print(f"  lam={config.lam}")
     print(f"  sc_max_lr={config.sc_max_lr}")
     print(f"  md_max_lr={config.md_max_lr}")
-    print(f"  epochs_single={config.epochs_single}")
-    print(f"  epochs_merged={config.epochs_merged}")
+    if config.iterations_single is not None:
+        print(f"  iterations_single={config.iterations_single}")
+        print(f"  iterations_merged={config.iterations_merged}")
+        print(f"  validation_every_iterations={config.validation_every_iterations}")
+    else:
+        print(f"  epochs_single={config.epochs_single}")
+        print(f"  epochs_merged={config.epochs_merged}")
     print(f"  train_ds={args.train_ds} ({train_dataset.num_rows} samples)")
     print(f"  val_ds={args.val_ds}")
     if args.resume_checkpoint:
@@ -592,7 +661,9 @@ def main(argv=None):
         dataloader = make_dataloader()
         enc_params = list(single.analysis_transform.parameters())
         dec_params = [p for p in single.parameters() if not any(p is q for q in enc_params)]
-        total_steps_single = config.epochs_single[i_channel] * num_batches
+        single_iterations = (config.iterations_single[i_channel]
+                             if config.iterations_single is not None else None)
+        total_steps_single = single_iterations or config.epochs_single[i_channel] * num_batches
         sc_losses = train_one(
             single,
             [{'params': enc_params, 'lr': config.encoder_lr_scale[i_channel]},
@@ -601,6 +672,7 @@ def main(argv=None):
             total_steps_single, config.epochs_single[i_channel], f"ch{i_channel}",
             lam=config.lam[i_channel], max_lr=config.sc_max_lr[i_channel],
             lr_pow=config.sc_lr_pow[i_channel], rpe=config.rpe[i_channel], tracker=tracker,
+            iterations=single_iterations,
         )
         train_losses.append(sc_losses)
         single_channel_weights.append({k: v.cpu() for k, v in single.state_dict().items()})
@@ -666,7 +738,9 @@ def main(argv=None):
 
         decoder_params = list(new_merged.decoder.parameters())
         dataloader = make_dataloader()
-        total_steps_merged = config.epochs_merged[i_channel] * num_batches
+        merged_iterations = (config.iterations_merged[i_channel]
+                             if config.iterations_merged is not None else None)
+        total_steps_merged = merged_iterations or config.epochs_merged[i_channel] * num_batches
         early_stopper = None
         epoch_evaluator = None
         if args.early_stopping:
@@ -676,11 +750,14 @@ def main(argv=None):
                 min_epochs=args.early_stopping_min_epochs,
             )
 
-            def epoch_evaluator(i_epoch, _model, _channel=i_channel, _n_ch=n_ch):
+            def epoch_evaluator(monitor_step, _model, _channel=i_channel, _n_ch=n_ch,
+                                _iteration_mode=merged_iterations is not None):
                 epoch_psnr, epoch_cr = validate(_model, device, early_stopping_dataset, config)
-                tracker.scalar(f'early_stopping/ch{_channel}/psnr', epoch_psnr, i_epoch + 1)
-                tracker.scalar(f'early_stopping/ch{_channel}/compression_ratio', epoch_cr, i_epoch + 1)
-                print(f"  merge{_n_ch}ch epoch {i_epoch + 1} "
+                tracker_step = monitor_step if _iteration_mode else monitor_step + 1
+                unit = 'iteration' if _iteration_mode else 'epoch'
+                tracker.scalar(f'early_stopping/ch{_channel}/psnr', epoch_psnr, tracker_step)
+                tracker.scalar(f'early_stopping/ch{_channel}/compression_ratio', epoch_cr, tracker_step)
+                print(f"  merge{_n_ch}ch {unit} {tracker_step} "
                       f"monitor_psnr={epoch_psnr:.3f} monitor_cr={epoch_cr:.2f}", flush=True)
                 return epoch_psnr
         merge_losses = train_one(
@@ -688,6 +765,8 @@ def main(argv=None):
             total_steps_merged, config.epochs_merged[i_channel], f"merge{n_ch}ch",
             lam=0.0, max_lr=config.md_max_lr[i_channel], lr_pow=config.md_lr_pow[i_channel],
             tracker=tracker, epoch_evaluator=epoch_evaluator, early_stopper=early_stopper,
+            iterations=merged_iterations,
+            validation_every_iterations=config.validation_every_iterations,
         )
         train_losses.append(merge_losses)
 

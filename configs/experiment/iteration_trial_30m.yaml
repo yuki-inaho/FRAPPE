@@ -1,0 +1,19 @@
+# @package _global_
+# A one-channel real-data pilot calibrated from the measured 640×480 throughput.
+# 200 + 500 optimizer updates are expected to take roughly 25–30 minutes on the
+# exclusively assigned RTX 5090, including four fixed-subset validations.
+experiment:
+  name: iteration_trial_30m
+
+model:
+  ps: [32]
+
+training:
+  iterations_single: [200]
+  iterations_merged: [500]
+
+validation:
+  every_iterations: 125
+
+checkpoint:
+  keep_best_k: 1

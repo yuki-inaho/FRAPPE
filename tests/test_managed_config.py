@@ -23,6 +23,8 @@ def test_hydra_config_builds_backward_compatible_cli() -> None:
     assert argv[argv.index("--optimizer") + 1] == "amuse"
     assert argv[argv.index("--min_width") + 1] == "640"
     assert argv[argv.index("--validation_height") + 1] == "480"
+    assert argv[argv.index("--iterations_single") + 1] == "106"
+    assert argv[argv.index("--validation_every_iterations") + 1] == "53"
     augmentation = json.loads(argv[argv.index("--augmentation_config") + 1])
     assert augmentation["transforms"]["channel_shuffle"]["name"] == "ChannelShuffle"
 
@@ -41,3 +43,13 @@ def test_augmentation_profile_can_be_selected_modularly() -> None:
         cfg = compose(config_name="config", overrides=["augmentation=rgb_strong"])
     assert cfg.augmentation.transforms.channel_shuffle.p == 0.25
     assert cfg.augmentation.transforms.to_gray.name == "ToGray"
+
+
+def test_iteration_trial_preset_is_fixed_update_based() -> None:
+    config_dir = str(Path(__file__).parents[1] / "configs")
+    with initialize_config_dir(version_base=None, config_dir=config_dir):
+        cfg = compose(config_name="config", overrides=["experiment=iteration_trial_30m"])
+    assert cfg.model.ps == [32]
+    assert cfg.training.iterations_single == [200]
+    assert cfg.training.iterations_merged == [500]
+    assert cfg.validation.every_iterations == 125
