@@ -3,6 +3,10 @@
 For anonymous local-dataset preparation and Hydra/TensorBoard experiment
 management, see [MANAGED_TRAINING.md](MANAGED_TRAINING.md).
 
+For joint prefix training -- every latent channel trained at once through a
+full-width superdecoder instead of one channel at a time -- see
+[JOINT_PREFIX_TRAINING.md](JOINT_PREFIX_TRAINING.md).
+
 ## Full Input, Residual Output Autoencoding with Projection Pursuit Encoder
 
 [project page](https://UT-SysML.github.io/FRAPPE)
