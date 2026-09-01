@@ -764,3 +764,72 @@ prefix ラダーのように片方が構成上単調な系列では **常に 1.0
 | `--subset_prob > 0` 時に蒸留教師・単調性ペア・ログが末尾の部分集合を指す | 既定 0 のため今回の測定には無影響。既知の制約として記録 |
 
 テスト 66 件通過。
+
+---
+
+## PDCA-4: 圧縮率 40 倍の動作点 (2026-09-02T04:36–04:58+09:00)
+
+### Plan
+
+`--target_bpp 0.60`（= CR 40）。CR-50 の 21 チャネル親モデル (step 29000) から
+双対上昇のλを 0.9 で再開し、continuation は soft 主体 `0.0 0.02 0.85 0.95`
+（Q3 hard STE の長時間適用が低レートで劣化させるという PDCA-3 の知見を反映）。
+検証は `--rate_images 16` を `--validation_images 16` に一致させ、PSNR と bpp を同一集合で測定。
+
+### Do / Check
+
+1. 21ch を 14,000 iteration で 0.60 bpp へ再ターゲット → **29.77 dB @ 0.5948 bpp**
+2. 厳密貪欲後方削除の frontier:
+
+   ```
+   keep 21   0.5948 bpp   29.77 dB
+   keep 20   0.5940 bpp   29.77 dB   dropped ch5
+   keep 19   0.5914 bpp   29.77 dB   dropped ch3
+   keep 18   0.5908 bpp   29.77 dB   dropped ch19
+   keep 17   0.5879 bpp   29.76 dB   dropped ch2   ← ここまで無損失
+   keep 16   0.5759 bpp   29.65 dB   dropped ch17  ← -0.12 dB
+   ```
+
+   CR 50 のときは 16 まで無損失だったが、レートが上がると 17 が下限になる。
+   **「精度をできるだけ保つ」という目標に従い 17 チャネルを採用**。
+
+3. **pruning 直後は中間 prefix の単調性が壊れた**（違反 2/16、n=14 で 19.66 dB）。
+   pruning で残した集合が非 prefix なので、pruned モデルの中間 prefix は
+   元モデルのどの動作点とも一致せず、prefix adapter の添字も学習時と食い違うため。
+   **full prefix（目標動作点）は厳密に保存されている**が、ラダーは壊れる。
+   CR-50 側で違反 0 だったのは pruning の**後**に fine-tune していたためだった。
+
+4. 同じ手順を適用（`--resume_model_only` で 10,000 iteration）→ **違反 0/16 に回復**。
+
+### 最終結果（CR 40 動作点、17 チャネル）
+
+| split | PSNR | bpp | CR | 単調性違反 |
+| --- | ---: | ---: | ---: | ---: |
+| validation | **29.78 dB** | 0.5931 | **40.47** | 0/16 |
+| test（held-out） | **30.06 dB** | 0.6105 | **39.31** | 0/16 |
+
+同一 16 枚での横並び（validation 動作点 0.5931 bpp）:
+
+| コーデック | PSNR | 差 |
+| --- | ---: | ---: |
+| **本モデル (17ch)** | **29.78 dB** | — |
+| AVIF (libaom) | 29.71 | +0.07 |
+| WebP | 28.93 | +0.85 |
+| **公開 FRAPPE** | **28.34** | **+1.44** |
+| JPEG | 27.34 | +2.44 |
+| JPEG 2000 | 26.11 | +3.67 |
+
+test 動作点 0.6105 bpp では 30.06 dB 対 AVIF 29.88 dB（+0.18）。
+
+構造: 21→17 チャネル、decoder 入力 84→65、解析パラメータ 14,745→7,817（-47%）。
+ONNX: 符号 **1,833,500 シンボル全て bit-identical**、CPU 1 スレッドで encode 2.45 ms
+(199 Mpixel/s)、decode 537 ms。
+
+### 二つの動作点のまとめ
+
+| 目標 | モデル | ch | validation | test |
+| --- | --- | ---: | --- | --- |
+| CR 40 | `joint_17ch_cr40_ft/final17.pth.tar` | 17 | 29.78 dB / CR 40.47 | 30.06 dB / CR 39.31 |
+| CR 50 | `joint_16ch_cr50_ft/final16.pth.tar` | 16 | 28.63 dB / CR 50.53 | 28.89 dB / CR 48.66 |
+
+いずれも公開 FRAPPE 重みを 1.1〜1.4 dB、AVIF をわずかに上回る。
