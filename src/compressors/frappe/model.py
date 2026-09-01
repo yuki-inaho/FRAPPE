@@ -31,19 +31,23 @@ class LayerNormND(torch.nn.Module):
         self.num_channels = num_channels
 
     def forward(self, x):
+        # Positive destination indices only: the ONNX exporter turns a negative
+        # ``movedim`` argument into a Transpose whose ``perm`` still contains -1,
+        # which onnxruntime rejects at load time. Semantically identical.
+        last = x.dim() - 1
         return torch.nn.functional.layer_norm(
-            x.movedim(1, -1), (self.num_channels,), self.weight, self.bias, self.eps
-        ).movedim(-1, 1)
+            x.movedim(1, last), (self.num_channels,), self.weight, self.bias, self.eps
+        ).movedim(last, 1)
 
 
 class _ChannelsLast(torch.nn.Module):
     def forward(self, x):
-        return x.movedim(1, -1)
+        return x.movedim(1, x.dim() - 1)
 
 
 class _ChannelsFirst(torch.nn.Module):
     def forward(self, x):
-        return x.movedim(-1, 1)
+        return x.movedim(x.dim() - 1, 1)
 
 
 class Residual(torch.nn.Module):
