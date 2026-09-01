@@ -120,6 +120,25 @@ pixi run python tools/evaluate_local_checkpoint.py \
   --dataset-root /workspace/data/frappe_rgb_800x608/imagefolder
 ```
 
+## Exporting a reconstructed validation image
+
+Export an anonymous validation sample without copying its source filename into
+the result.  `--output` is the actual model reconstruction; the optional
+comparison image places the reference beside it for visual inspection.
+
+```bash
+pixi run python tools/export_local_reconstruction.py \
+  --checkpoint runs/iteration_9ch_1h_001/checkpoints/last.pth.tar \
+  --dataset-root /home/kasm-user/Desktop/data/frappe_rgb_640x480/imagefolder \
+  --split validation --index 0 \
+  --output /home/kasm-user/Desktop/frappe_9ch_validation_reconstruction.png \
+  --comparison-output /home/kasm-user/Desktop/frappe_9ch_validation_comparison.png
+```
+
+For a non-cherry-picked representative sample, replace `--index 0` with
+`--representative`.  It scores the requested split and chooses the image whose
+per-image PSNR is closest to the split median.
+
 ## AMUSE and EMA
 
 AMUSE is vendored from the official Apache-2.0 implementation at a pinned
