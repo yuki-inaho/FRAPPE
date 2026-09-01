@@ -833,3 +833,88 @@ ONNX: 符号 **1,833,500 シンボル全て bit-identical**、CPU 1 スレッド
 | CR 50 | `joint_16ch_cr50_ft/final16.pth.tar` | 16 | 28.63 dB / CR 50.53 | 28.89 dB / CR 48.66 |
 
 いずれも公開 FRAPPE 重みを 1.1〜1.4 dB、AVIF をわずかに上回る。
+
+---
+
+## PDCA-5: ONNX をビットストリーム境界まで引き上げる (2026-09-02T08:30–08:50+09:00)
+
+### Plan — 問いは三つ
+
+1. 論文の「各 scale を 1 枚の 2D グレースケール平面 `(n_s·T1/p_s, T2/p_s)` に並べ替え、
+   length-prefixed JPEG-LS を適用する」という部分は、encoder モデル側で対応できているか。
+2. ONNX モデルの入出力の型は妥当か。
+3. onnx-simplifier で最適化する。
+
+### Check — 1 の答えは「対応できていなかった」
+
+`tools/export_onnx.py` の encoder は **4D int8 符号 `(N, C, H/p, W/p)` で止まっており**、
+論文の 2D 平面化と `+127 → uint8` シフトは Python 側（`entropy_coding.arrange_latents` /
+`encode_latents`）にあった。どちらも純粋なテンソル演算なので、グラフの中にあるべきものだった。
+
+### Act — 分割点をエントロピー符号器のちょうど手前へ
+
+| グラフ | 入力 | 出力 |
+| --- | --- | --- |
+| `*_encoder.onnx` | `image (1, 3, 32h, 32w) uint8` | scale 群ごとに `uint8` 平面 `(1, n_s·32h/p_s, 32w/p_s)` |
+| `*_decoder.onnx` | 同じ平面 | `reconstruction (1, 3, 32h, 32w) uint8` |
+
+グラフの外に残すのは **JPEG-LS 本体と 4 バイト長さ接頭辞だけ**。これはバイト厳密な標準符号と
+コンテナであって算術ではない。encoder の出力は JPEG-LS が読むグレースケール画像そのものになり、
+モデルと符号器の間に間違えられる算術が残らない。
+
+**入出力型**: 両側 uint8 に統一し、`/127.5 - 1` の正規化をグラフ内に入れた（正規化は
+取り違えの典型的な場所なので、グラフに持たせる）。`--io float` で従来の
+`[-1,1]` float 画像 + int8 平面も出せる。
+
+**動的形状**: 従来は `dynamic_axes` を宣言していたが**実際には効いていなかった**。
+einops `rearrange` と `unflatten` が traced 形状を Reshape に焼き込み、
+800x608 以外では `Reshape` が実行時エラーになっていた（宣言だけ動的で実体は静的、
+という一番たちの悪い状態）。対処:
+
+- `ops.adapt_to_decoder` の einops `rearrange` を `F.pixel_unshuffle` に、
+  `F.interpolate(nearest)` を `repeat_interleave` に置換。**bit-identical**
+  （`test_adapt_to_decoder_matches_the_einops_formulation` が公開スケジュールの
+  全 patch size で検証）。einops はテンソルから空間サイズを解決するため焼き込む。
+- TorchScript exporter から **dynamo exporter** へ移行し、平面の広がりを
+  **論文の関係式そのもの**として渡す: サイズを最大 patch size 単位で表し、
+  `rows = n_s·(max_ps/p_s)·units_h`、`cols = (max_ps/p_s)·units_w`。
+- batch 軸は 1 固定（モデルが特殊化しており、画像コーデックは 1 枚ずつ符号化する）。
+- `units_h/units_w >= 2`（第1畳み込みの reflect padding はグリッド 1 で未定義）。
+
+結果、グラフのメタデータに関係式が残る:
+
+```
+image        UINT8  [1, 3, '32*units_h', '32*units_w']
+plane_p32    UINT8  [1,    'units_h',       'units_w']
+plane_p16    UINT8  [1, '10*units_h',    '2*units_w']
+plane_p2     UINT8  [1, '16*units_h',   '16*units_w']
+```
+
+**opset**: dynamo は opset 18 を出す。17 を要求すると onnx の version converter が
+`Pad` の downgrade adapter を持たず失敗するので、既定を 18 にした。
+
+**onnx-simplifier**: encoder 91 ノード、decoder 192〜195 ノードへ整理。
+
+### Check — 検証は宣言ではなく実測
+
+| 項目 | CR 40 (17ch) | CR 50 (16ch) |
+| --- | --- | --- |
+| encoder 平面 vs `arrange_latents`+shift | **0/1,833,500 不一致** | **0/1,347,100 不一致** |
+| JPEG-LS ペイロード | **byte-identical** | **byte-identical** |
+| 参照 blob（画像0、長さ接頭辞込み） | 36,586 B | 29,288 B |
+| decoder 出力 vs PyTorch | max 1 / 79 画素 (0.0014%) | max 1 / 82 画素 (0.0014%) |
+| 96x64 / 480x320 / 800x608 / 1920x1088 | すべて ok | すべて ok |
+| CPU encode (1 スレッド, 800x608) | 2.68 ms (182 Mpixel/s) | 2.66 ms (183 Mpixel/s) |
+| CPU decode | 502 ms | 513 ms |
+
+decoder に 1 code level の差を許すのは、PyTorch と異なる順序でチャネルを畳み込むため
+float32 の値が丸め境界のどちら側にも落ちうるからで、これは算術であって欠陥ではない。
+1 を超える差、または広範囲の差はエクスポートを失敗させる。
+
+`adapt_to_decoder` 書き換え後に CR-50 モデルを再評価し、
+**28.63 dB / 0.4750 bpp / CR 50.53 と書き換え前に完全一致**することを確認した。
+
+### 副次的な指摘（未着手、リファクタリング時に扱う）
+
+`README.md` から `MANAGED_TRAINING.md` / `JOINT_PREFIX_TRAINING.md` への
+ポインタ段落を削除（利用者の指示）。`docs/` 以下には言及しない方針。
