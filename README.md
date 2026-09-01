@@ -1,5 +1,8 @@
 # FRAPPE
 
+For anonymous local-dataset preparation and Hydra/TensorBoard experiment
+management, see [MANAGED_TRAINING.md](MANAGED_TRAINING.md).
+
 ## Full Input, Residual Output Autoencoding with Projection Pursuit Encoder
 
 [project page](https://UT-SysML.github.io/FRAPPE)

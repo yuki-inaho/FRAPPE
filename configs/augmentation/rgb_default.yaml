@@ -1,0 +1,49 @@
+# Albumentations profile for natural RGB imagery.  Geometry is sampled per
+# batch; colour and orientation transforms are sampled per image.
+min_aspect: 1.3333333333
+max_aspect: 1.3333333333
+min_size: 480
+max_size: 480
+min_width: 640
+max_width: 640
+validation_height: 480
+validation_width: 640
+min_scale: 1.0
+max_scale: 2.0
+
+# Entries can be enabled/disabled or retuned independently with Hydra, e.g.
+# augmentation.transforms.channel_shuffle.p=0.25.  Available names are
+# documented in MANAGED_TRAINING.md and validated before training begins.
+transforms:
+  color_jitter:
+    name: ColorJitter
+    brightness: 0.20
+    contrast: 0.20
+    saturation: 0.20
+    hue: 0.05
+    p: 0.80
+  hue_saturation_value:
+    name: HueSaturationValue
+    hue_shift_limit: 10
+    sat_shift_limit: 20
+    val_shift_limit: 10
+    p: 0.35
+  rgb_shift:
+    name: RGBShift
+    r_shift_limit: 10
+    g_shift_limit: 10
+    b_shift_limit: 10
+    p: 0.20
+  channel_shuffle:
+    name: ChannelShuffle
+    p: 0.10
+  horizontal_flip:
+    name: HorizontalFlip
+    p: 0.50
+  vertical_flip:
+    name: VerticalFlip
+    p: 0.10
+  random_gamma:
+    name: RandomGamma
+    gamma_limit: [90, 110]
+    p: 0.20

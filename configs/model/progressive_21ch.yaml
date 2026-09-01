@@ -1,0 +1,17 @@
+# Released-model architecture. This does not claim exact paper-training
+# reproduction because the complete per-channel training schedule is unpublished.
+input_channels: 3
+ps: [32, 32, 32, 16, 16, 16, 16, 16, 16, 8, 8, 8, 4, 4, 4, 4, 4, 4, 2, 2, 2]
+decoder_ps: 8
+decoder_dim: 768
+decoder_kernel_size: 3
+decoder_arch: CCCCCCCCCCCC
+decoder_mlp_ratio: 4.0
+decoder_layerscale: true
+decoder_layerscale_init: 1.0e-6
+encoder_arch: SC8
+linear_input: false
+# At 640×480, batch 14 fits narrowly and 15 OOMs. 12 keeps about 6 GiB of
+# headroom with AMUSE+EMA on the exclusively assigned RTX 5090.
+recommended_batch_size: 12
+recommended_num_workers: 4

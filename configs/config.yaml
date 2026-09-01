@@ -1,0 +1,82 @@
+defaults:
+  - data: anonymous_rgb
+  - model: smoke
+  - augmentation: rgb_default
+  - _self_
+  - experiment: amuse_ema
+
+device: cuda:0
+seed: 0
+
+run:
+  id: exp_001
+  dir: ${oc.env:FRAPPE_RUN_ROOT,/home/kasm-user/Desktop/FRAPPE/runs}/${run.id}
+
+optimization:
+  optimizer: adan
+  # Managed runs use a 0.99 model EMA by default. Set 0.0 for exact
+  # pre-management behavior or change this value for a different time scale.
+  ema_decay: 0.99
+  lam: [0.008]
+  rpe: [0.3]
+  encoder_lr_scale: [0.3]
+  sc_max_lr: [5.0e-5]
+  sc_lr_pow: [2]
+  md_max_lr: [5.0e-4]
+  md_lr_pow: [2]
+  min_lr: 1.0e-8
+  grad_clip: 1.5
+  # AMUSE defaults follow the official image-training example. AMUSE is
+  # schedule-free; sc/md cosine controls are ignored when it is selected.
+  amuse_beta: 0.8
+  amuse_beta2: 0.999
+  amuse_eps: 1.0e-10
+  amuse_momentum: 0.95
+  amuse_rho: 0.3
+  amuse_r: 0.0
+  amuse_weight_lr_power: 2.0
+  amuse_warmup_ratio: 0.05
+  amuse_weight_decay: 0.0
+  amuse_weight_decay_at_y: 0.0
+  amuse_aux_update_type: adamw
+  amuse_muon_min_ndim: 2
+
+training:
+  # Epoch counts are explicit per progressive channel. The final value repeats
+  # when the list is shorter than the channel count.
+  epochs_single: [2]
+  epochs_merged: [4]
+  # Values come from the selected model's measured GPU profile. Override for
+  # smoke tests, smaller crops, or a shared GPU.
+  batch_size: ${model.recommended_batch_size}
+  num_workers: ${model.recommended_num_workers}
+  dataset_samples: null
+  validation_samples: null
+  max_batches_per_epoch: null
+  merged_decoder_noise: false
+  merged_decoder_round: true
+
+checkpoint:
+  keep_best_k: 3
+  resume_checkpoint: null
+  resume_channels: null
+
+early_stopping:
+  # Applied after merged-decoder epochs only. The final reported validation
+  # still uses the complete validation split; this smaller fixed subset keeps
+  # per-epoch model selection practical.
+  enabled: true
+  patience: 2
+  min_delta: 0.01
+  min_epochs: 2
+  samples: 128
+
+logging:
+  tensorboard: true
+
+hydra:
+  job:
+    chdir: false
+  run:
+    dir: ${run.dir}/hydra
+  output_subdir: config

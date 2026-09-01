@@ -1,0 +1,50 @@
+# Stronger optional profile. Select with `augmentation=rgb_strong` for data
+# where image orientation and colour/channel order do not carry a label.
+min_aspect: 1.3333333333
+max_aspect: 1.3333333333
+min_size: 480
+max_size: 480
+min_width: 640
+max_width: 640
+validation_height: 480
+validation_width: 640
+min_scale: 1.0
+max_scale: 2.0
+
+transforms:
+  color_jitter:
+    name: ColorJitter
+    brightness: 0.35
+    contrast: 0.35
+    saturation: 0.35
+    hue: 0.10
+    p: 0.90
+  hue_saturation_value:
+    name: HueSaturationValue
+    hue_shift_limit: 20
+    sat_shift_limit: 35
+    val_shift_limit: 20
+    p: 0.60
+  rgb_shift:
+    name: RGBShift
+    r_shift_limit: 20
+    g_shift_limit: 20
+    b_shift_limit: 20
+    p: 0.40
+  channel_shuffle:
+    name: ChannelShuffle
+    p: 0.25
+  horizontal_flip:
+    name: HorizontalFlip
+    p: 0.50
+  vertical_flip:
+    name: VerticalFlip
+    p: 0.50
+  random_gamma:
+    name: RandomGamma
+    gamma_limit: [80, 120]
+    p: 0.35
+  to_gray:
+    name: ToGray
+    num_output_channels: 3
+    p: 0.05

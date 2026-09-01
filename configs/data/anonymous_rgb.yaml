@@ -1,0 +1,1 @@
+root: ${oc.env:FRAPPE_DATA_ROOT,/home/kasm-user/Desktop/data/frappe_rgb_640x480/imagefolder}

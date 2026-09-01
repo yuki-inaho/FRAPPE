@@ -1,0 +1,7 @@
+# @package _global_
+experiment:
+  name: amuse_ema_progressive_training
+
+optimization:
+  optimizer: amuse
+  ema_decay: 0.99

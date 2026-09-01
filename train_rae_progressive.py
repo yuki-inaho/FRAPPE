@@ -16,17 +16,33 @@ only the input channel count grows.
 import os
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "garbage_collection_threshold:0.5"
 
-import argparse, io, json, time
+import argparse, atexit, io, json, random, time
 import torch, datasets, PIL.Image, pillow_jpls, numpy as np
 import bjontegaard as bd
 from types import SimpleNamespace
 from timm.optim import Adan
 from torchvision.transforms.v2.functional import pil_to_tensor, to_pil_image
-from torchvision.transforms import Compose, Resize, RandomCrop, ColorJitter
 
 from src.compressors.frappe.model import AutoencoderSingleChannel, MergedAutoencoder
 from src.compressors.frappe.ops import get_scale_groups, decoder_channels_per_encoder
 from src.compressors.frappe.quantize import srgb_to_linear
+from src.compressors.frappe.augmentation import RGBTrainingAugmentation
+from src.compressors.frappe.experiment import (
+    KBestCheckpointManager,
+    EarlyStopping,
+    ModelEMA,
+    TensorBoardTracker,
+    atomic_json_dump,
+    atomic_torch_save,
+)
+from src.compressors.frappe.third_party.amuse import AMUSE
+
+
+def seed_worker(_worker_id):
+    """Make Python/NumPy augmentations deterministic in each loader worker."""
+    worker_seed = torch.initial_seed() % (2 ** 32)
+    random.seed(worker_seed)
+    np.random.seed(worker_seed)
 
 
 def merge_encoder(merged, single_channel, scale_idx, ch_in_scale):
@@ -39,21 +55,79 @@ def merge_encoder(merged, single_channel, scale_idx, ch_in_scale):
         mp.data[ch_in_scale:ch_in_scale+1] = sp.data
 
 
+def make_amuse_optimizer(param_groups, max_lr, total_steps, config):
+    """Create official AMUSE groups from FRAPPE's encoder/decoder LR groups."""
+    warmup_steps = max(1, int(np.ceil(total_steps * config.amuse_warmup_ratio)))
+    if param_groups and not isinstance(param_groups[0], dict):
+        # torch.optim accepts a bare parameter iterable; the frozen merged
+        # decoder path uses that convention, so normalize it here.
+        param_groups = [{'params': param_groups, 'lr': 1.0}]
+    groups = []
+    for source_group in param_groups:
+        lr_scale = float(source_group.get('lr', 1.0))
+        params = [p for p in source_group['params'] if p.requires_grad]
+        muon_params = [p for p in params if p.ndim >= config.amuse_muon_min_ndim]
+        aux_params = [p for p in params if p.ndim < config.amuse_muon_min_ndim]
+        common = {'lr': max_lr * lr_scale, 'weight_decay': config.amuse_weight_decay}
+        if muon_params:
+            groups.append({
+                **common,
+                'params': muon_params,
+                'use_muon': True,
+                'momentum': config.amuse_momentum,
+                'aux_update_type': config.amuse_aux_update_type,
+            })
+        if aux_params:
+            groups.append({
+                **common,
+                'params': aux_params,
+                'use_muon': False,
+                'update_type': config.amuse_aux_update_type,
+                'beta2': config.amuse_beta2,
+                'eps': config.amuse_eps,
+            })
+    if not groups:
+        raise ValueError('AMUSE received no trainable parameters')
+    optimizer = AMUSE(
+        groups,
+        beta1=config.amuse_beta,
+        warmup_steps=warmup_steps,
+        rho=config.amuse_rho,
+        r=config.amuse_r,
+        weight_lr_power=config.amuse_weight_lr_power,
+        weight_decay_at_y=config.amuse_weight_decay_at_y,
+    )
+    optimizer.train()
+    return optimizer
+
+
 def train_one(model, param_groups, dataloader, device, config, total_steps, epochs, label,
-              lam=0.0, max_lr=1e-3, lr_pow=2, rpe=0.3):
+              lam=0.0, max_lr=1e-3, lr_pow=2, rpe=0.3, tracker=None,
+              epoch_evaluator=None, early_stopper=None):
     def rc_sched(i_step):
         t = i_step / total_steps
         return (max_lr - config.min_lr) * (1 - (np.cos(np.pi * t)) ** (2 * lr_pow)) + config.min_lr
-    optimizer = Adan(param_groups, lr=1.0)
+    if config.optimizer == 'adan':
+        optimizer = Adan(param_groups, lr=1.0)
+        schedule = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lambda s: rc_sched(s))
+    elif config.optimizer == 'amuse':
+        optimizer = make_amuse_optimizer(param_groups, max_lr, total_steps, config)
+        schedule = None
+    else:
+        raise ValueError(f'Unknown optimizer: {config.optimizer}')
     all_params = [p for g in optimizer.param_groups for p in g['params']]
-    schedule = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lambda s: rc_sched(s))
+    ema = ModelEMA(model, config.ema_decay) if config.ema_decay > 0 else None
     log_mse_losses = []
     rate_losses = []
 
     for i_epoch in range(epochs):
         model.train()
         n_batches = len(dataloader)
+        epoch_loss_start = len(log_mse_losses)
+        epoch_rate_start = len(rate_losses)
         for i_batch, x in enumerate(dataloader):
+            if config.max_batches_per_epoch is not None and i_batch >= config.max_batches_per_epoch:
+                break
             x = x.to(device)
             x_in = srgb_to_linear(x) if config.linear_input else x
             pred = model(x_in)
@@ -69,9 +143,27 @@ def train_one(model, param_groups, dataloader, device, config, total_steps, epoc
                 total_loss = log_mse_loss
             optimizer.zero_grad()
             total_loss.backward()
-            torch.nn.utils.clip_grad_norm_(all_params, config.grad_clip, norm_type=2.0)
+            grad_norm = torch.nn.utils.clip_grad_norm_(
+                all_params, config.grad_clip, norm_type=2.0).item()
             optimizer.step()
-            schedule.step()
+            if schedule is not None:
+                schedule.step()
+            if ema is not None:
+                if config.optimizer == 'amuse':
+                    optimizer.eval()
+                    ema.update(model)
+                    optimizer.train()
+                else:
+                    ema.update(model)
+
+            if tracker is not None:
+                step = tracker.next_step()
+                tracker.scalar(f"train/{label}/log_mse", log_mse_loss.item(), step)
+                tracker.scalar(f"train/{label}/loss", total_loss.item(), step)
+                tracker.scalar(f"train/{label}/learning_rate", optimizer.param_groups[0]['lr'], step)
+                tracker.scalar(f"train/{label}/grad_norm", grad_norm, step)
+                if rate_losses:
+                    tracker.scalar(f"train/{label}/rate", rate_losses[-1], step)
 
             if i_batch % 500 == 0:
                 avg = np.mean(log_mse_losses[-100:]) if log_mse_losses else 0
@@ -82,6 +174,34 @@ def train_one(model, param_groups, dataloader, device, config, total_steps, epoc
 
             del x, x_in, pred, target, log_mse_loss, total_loss
 
+        if tracker is not None and log_mse_losses:
+            tracker.scalar(f'train/{label}/epoch_log_mse', np.mean(log_mse_losses[epoch_loss_start:]), i_epoch)
+            if len(rate_losses) > epoch_rate_start:
+                tracker.scalar(f'train/{label}/epoch_rate', np.mean(rate_losses[epoch_rate_start:]), i_epoch)
+
+        should_stop = False
+        if epoch_evaluator is not None:
+            if config.optimizer == 'amuse':
+                optimizer.eval()
+            score = epoch_evaluator(i_epoch, model)
+            if early_stopper is not None:
+                should_stop = early_stopper.step(score, i_epoch, model, ema)
+                if should_stop:
+                    print(f"  {label} early stopping at epoch {i_epoch + 1}; "
+                          f"best epoch={early_stopper.best_epoch + 1}, "
+                          f"best_psnr={early_stopper.best_score:.3f}", flush=True)
+            if config.optimizer == 'amuse' and not should_stop:
+                optimizer.train()
+        if should_stop:
+            break
+
+    if config.optimizer == 'amuse':
+        optimizer.eval()
+    if early_stopper is not None:
+        early_stopper.restore(model, ema)
+    if ema is not None:
+        ema.copy_to(model)
+
     return log_mse_losses
 
 
@@ -91,10 +211,16 @@ def validate(merged, device, val_dataset, config):
     psnrs, bpps = [], []
     for sample in val_dataset:
         img = sample['image']
+        if config.validation_height is not None:
+            img = img.resize(
+                (config.validation_width, config.validation_height),
+                PIL.Image.Resampling.BICUBIC,
+            )
         w, h = img.size
-        h_rs = max_ps * (h // max_ps)
-        w_rs = max_ps * (w // max_ps)
-        img = img.resize((w_rs, h_rs), PIL.Image.Resampling.BICUBIC)
+        if h % max_ps or w % max_ps:
+            raise ValueError(
+                f'validation image size {w}x{h} must divide by maximum patch size {max_ps}; '
+                'set --validation_height/--validation_width to aligned dimensions')
         x = pil_to_tensor(img.convert("RGB")).to(torch.float).to(device).unsqueeze(0) / 127.5 - 1.0
         x_in = srgb_to_linear(x) if config.linear_input else x
         with torch.inference_mode():
@@ -119,7 +245,7 @@ def validate(merged, device, val_dataset, config):
     return np.mean(psnrs), mean_cr
 
 
-def parse_args():
+def parse_args(argv=None):
     p = argparse.ArgumentParser()
     p.add_argument('--device', type=str, required=True)
     p.add_argument('--input_channels', type=int, default=3)
@@ -146,8 +272,22 @@ def parse_args():
     p.add_argument('--max_aspect', type=float, default=1.0)
     p.add_argument('--min_size', type=int, default=480)
     p.add_argument('--max_size', type=int, default=480)
+    p.add_argument('--min_width', type=int, default=None,
+                   help='minimum training crop width; defaults to height × aspect')
+    p.add_argument('--max_width', type=int, default=None,
+                   help='maximum training crop width; defaults to height × aspect')
     p.add_argument('--min_scale', type=float, default=1.0)
     p.add_argument('--max_scale', type=float, default=2.0)
+    p.add_argument('--validation_height', type=int, default=None,
+                   help='fixed validation resize height (managed default: 480)')
+    p.add_argument('--validation_width', type=int, default=None,
+                   help='fixed validation resize width (managed default: 640)')
+    p.add_argument('--augmentation_config', type=str, default=json.dumps({
+        'transforms': [{
+            'name': 'ColorJitter', 'brightness': 0.4, 'contrast': 0.0,
+            'saturation': 0.4, 'hue': 0.0, 'p': 1.0,
+        }],
+    }), help='JSON Albumentations configuration; managed runs generate this from Hydra')
     p.add_argument('--sc_max_lr', type=float, nargs='+', default=[5e-5])
     p.add_argument('--sc_lr_pow', type=float, nargs='+', default=[2])
     p.add_argument('--md_max_lr', type=float, nargs='+', default=[5e-4])
@@ -159,20 +299,86 @@ def parse_args():
     p.add_argument('--train_ds', type=str, default='danjacobellis/LSDIR')
     p.add_argument('--val_ds', type=str, default='danjacobellis/kodak')
     p.add_argument('--dataset_samples', type=int, default=None)
+    p.add_argument('--validation_samples', type=int, default=None)
     p.add_argument('--resume_checkpoint', type=str, default=None)
     p.add_argument('--resume_channels', type=int, default=None)
-    return p.parse_args()
+    p.add_argument('--run_dir', type=str, default=None,
+                   help='Managed run directory for TensorBoard and K-best checkpoints')
+    p.add_argument('--tensorboard', type=lambda s: s.lower() in ('true','1','yes'), default=False)
+    p.add_argument('--keep_best_k', type=int, default=0,
+                   help='Keep the K highest validation-PSNR channel checkpoints')
+    p.add_argument('--seed', type=int, default=0)
+    p.add_argument('--max_batches_per_epoch', type=int, default=None,
+                   help='Debug/smoke-test limit; omit for full training')
+    p.add_argument('--optimizer', type=str, choices=['adan', 'amuse'], default='adan')
+    p.add_argument('--ema_decay', type=float, default=0.0,
+                   help='Model EMA; zero disables it to preserve paper-script behavior')
+    p.add_argument('--amuse_beta', type=float, default=0.8)
+    p.add_argument('--amuse_beta2', type=float, default=0.999)
+    p.add_argument('--amuse_eps', type=float, default=1e-10)
+    p.add_argument('--amuse_momentum', type=float, default=0.95)
+    p.add_argument('--amuse_rho', type=float, default=0.3)
+    p.add_argument('--amuse_r', type=float, default=0.0)
+    p.add_argument('--amuse_weight_lr_power', type=float, default=2.0)
+    p.add_argument('--amuse_warmup_ratio', type=float, default=0.05)
+    p.add_argument('--amuse_weight_decay', type=float, default=0.0)
+    p.add_argument('--amuse_weight_decay_at_y', type=float, default=0.0)
+    p.add_argument('--amuse_aux_update_type', type=str, choices=['adamw', 'sgd'], default='adamw')
+    p.add_argument('--amuse_muon_min_ndim', type=int, default=2)
+    p.add_argument('--early_stopping', type=lambda s: s.lower() in ('true','1','yes'), default=False)
+    p.add_argument('--early_stopping_patience', type=int, default=2)
+    p.add_argument('--early_stopping_min_delta', type=float, default=0.01)
+    p.add_argument('--early_stopping_min_epochs', type=int, default=2)
+    p.add_argument('--early_stopping_samples', type=int, default=128)
+    return p.parse_args(argv)
 
 
-def main():
-    args = parse_args()
+def main(argv=None):
+    args = parse_args(argv)
     device = args.device
     t0 = time.time()
+    random.seed(args.seed)
+    np.random.seed(args.seed)
+    torch.manual_seed(args.seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(args.seed)
+    if not 0.0 <= args.ema_decay < 1.0:
+        raise ValueError('ema_decay must be in [0, 1)')
+    if not 0.0 < args.amuse_beta < 1.0:
+        raise ValueError('amuse_beta must be in (0, 1)')
+    if not 0.0 < args.amuse_warmup_ratio <= 1.0:
+        raise ValueError('amuse_warmup_ratio must be in (0, 1]')
+    if args.amuse_muon_min_ndim < 2:
+        raise ValueError('amuse_muon_min_ndim must be at least 2')
+    if args.early_stopping and args.early_stopping_samples < 1:
+        raise ValueError('early_stopping_samples must be positive when enabled')
+    if (args.min_width is None) != (args.max_width is None):
+        raise ValueError('min_width and max_width must be supplied together')
+    if (args.validation_height is None) != (args.validation_width is None):
+        raise ValueError('validation_height and validation_width must be supplied together')
+    augmentation = RGBTrainingAugmentation.from_json(args.augmentation_config)
+
+    run_dir = os.path.abspath(args.run_dir) if args.run_dir else None
+    if run_dir:
+        os.makedirs(run_dir, exist_ok=True)
+        if args.save_checkpoint_name is None:
+            args.save_checkpoint_name = os.path.join(run_dir, 'checkpoints', 'last.pth.tar')
+    tracker = TensorBoardTracker(
+        os.path.join(run_dir, 'tensorboard') if run_dir else None,
+        enabled=args.tensorboard,
+    )
+    atexit.register(tracker.close)
 
     train_dataset = datasets.load_dataset(args.train_ds, split='train')
     if args.dataset_samples:
-        train_dataset = train_dataset.select(range(args.dataset_samples))
+        train_dataset = train_dataset.select(range(min(args.dataset_samples, train_dataset.num_rows)))
     val_dataset = datasets.load_dataset(args.val_ds, split='validation')
+    if args.validation_samples:
+        val_dataset = val_dataset.select(range(min(args.validation_samples, val_dataset.num_rows)))
+    early_stopping_dataset = val_dataset
+    if args.early_stopping:
+        early_stopping_dataset = val_dataset.select(
+            range(min(args.early_stopping_samples, val_dataset.num_rows)))
     n_channels = len(args.ps)
 
     config = SimpleNamespace()
@@ -192,10 +398,34 @@ def main():
                for ps in config.ps), "All encoder ps must be multiples/divisors of decoder_ps"
 
     num_batches = train_dataset.num_rows // config.batch_size
+    if num_batches < 1:
+        raise ValueError(
+            f"training split has {train_dataset.num_rows} samples, fewer than batch_size={config.batch_size}")
+    if config.max_batches_per_epoch is not None:
+        if config.max_batches_per_epoch < 1:
+            raise ValueError("max_batches_per_epoch must be positive")
+        num_batches = min(num_batches, config.max_batches_per_epoch)
     config.save_checkpoint_name = args.save_checkpoint_name or f'checkpoint_patchify_{device}.pth'
     config.train_ds = args.train_ds
     config.val_ds = args.val_ds
     max_ps = max(config.ps)
+    checkpoint_dir = os.path.dirname(os.path.abspath(config.save_checkpoint_name))
+    kbest = KBestCheckpointManager(
+        os.path.join(run_dir or checkpoint_dir, 'checkpoints', 'best')
+        if run_dir else os.path.join(checkpoint_dir, 'best'),
+        k=args.keep_best_k,
+        mode='max',
+    )
+    if run_dir:
+        atomic_json_dump({
+            'schema_version': 1,
+            'arguments': {k: v for k, v in vars(args).items()},
+            'runtime': {
+                'torch': torch.__version__,
+                'cuda': torch.version.cuda,
+                'device': torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'cpu',
+            },
+        }, os.path.join(run_dir, 'run_metadata.json'))
 
     all_groups = get_scale_groups(config.ps, n_channels)
     print(f"\n{'='*60}")
@@ -217,6 +447,12 @@ def main():
     print(f"  decoder_dim={config.decoder_dim}, mlp_ratio={config.decoder_mlp_ratio}")
     print(f"  decoder_arch={config.decoder_arch}")
     print(f"  encoder_arch={config.encoder_arch}")
+    print(f"  optimizer={config.optimizer}, ema_decay={config.ema_decay}")
+    print(f"  Albumentations={augmentation.describe()}")
+    if args.early_stopping:
+        print(f"  early_stopping=PSNR patience={args.early_stopping_patience} "
+              f"min_delta={args.early_stopping_min_delta} "
+              f"monitor_samples={early_stopping_dataset.num_rows}")
     print(f"  lam={config.lam}")
     print(f"  sc_max_lr={config.sc_max_lr}")
     print(f"  md_max_lr={config.md_max_lr}")
@@ -231,26 +467,37 @@ def main():
     def train_collate_fn(batch):
         aspect = np.random.uniform(config.min_aspect, config.max_aspect)
         h = np.random.uniform(config.min_size, config.max_size)
-        w = h * aspect
-        h = int((max_ps * (np.rint(h / max_ps))).clip(config.min_size, config.max_size))
-        w = int((max_ps * (np.rint(w / max_ps))).clip(config.min_size, config.max_size))
+        w = (np.random.uniform(config.min_width, config.max_width)
+             if config.min_width is not None else h * aspect)
+        # Each convolutional patch encoder needs both sides divisible by max_ps.
+        # The managed 640×480 setting is already exactly aligned.
+        h = max_ps * max(1, int(np.rint(h / max_ps)))
+        w = max_ps * max(1, int(np.rint(w / max_ps)))
         x = []
         for sample in batch:
-            transform = Compose([
-                Resize(int(max(h, w) * np.random.uniform(config.min_scale, config.max_scale)),
-                       interpolation=PIL.Image.Resampling.BICUBIC,
-                       max_size=1 + int(config.max_scale * config.max_size)),
-                RandomCrop((h, w), pad_if_needed=True, padding_mode='symmetric'),
-                ColorJitter(0.4, 0.0, 0.4, 0.0),
-            ])
-            xi = pil_to_tensor(transform(sample['image'].convert("RGB"))).unsqueeze(0)
+            image = augmentation(
+                sample['image'], height=h, width=w,
+                scale=np.random.uniform(config.min_scale, config.max_scale),
+                max_size=1 + int(config.max_scale * max(
+                    config.max_size,
+                    config.max_width if config.max_width is not None else config.max_size * config.max_aspect,
+                )),
+            )
+            xi = torch.from_numpy(np.ascontiguousarray(image)).permute(2, 0, 1).unsqueeze(0)
             x.append(xi)
         return torch.cat(x).to(torch.float) / 127.5 - 1.0
 
+    loader_index = 0
+
     def make_dataloader():
+        nonlocal loader_index
+        generator = torch.Generator()
+        generator.manual_seed(config.seed + loader_index)
+        loader_index += 1
         return torch.utils.data.DataLoader(
             train_dataset, batch_size=config.batch_size, num_workers=config.num_workers,
             drop_last=True, shuffle=True, collate_fn=train_collate_fn,
+            generator=generator, worker_init_fn=seed_worker,
         )
 
     if args.resume_checkpoint:
@@ -353,7 +600,7 @@ def main():
             dataloader, device, config,
             total_steps_single, config.epochs_single[i_channel], f"ch{i_channel}",
             lam=config.lam[i_channel], max_lr=config.sc_max_lr[i_channel],
-            lr_pow=config.sc_lr_pow[i_channel], rpe=config.rpe[i_channel],
+            lr_pow=config.sc_lr_pow[i_channel], rpe=config.rpe[i_channel], tracker=tracker,
         )
         train_losses.append(sc_losses)
         single_channel_weights.append({k: v.cpu() for k, v in single.state_dict().items()})
@@ -420,10 +667,27 @@ def main():
         decoder_params = list(new_merged.decoder.parameters())
         dataloader = make_dataloader()
         total_steps_merged = config.epochs_merged[i_channel] * num_batches
+        early_stopper = None
+        epoch_evaluator = None
+        if args.early_stopping:
+            early_stopper = EarlyStopping(
+                patience=args.early_stopping_patience,
+                min_delta=args.early_stopping_min_delta,
+                min_epochs=args.early_stopping_min_epochs,
+            )
+
+            def epoch_evaluator(i_epoch, _model, _channel=i_channel, _n_ch=n_ch):
+                epoch_psnr, epoch_cr = validate(_model, device, early_stopping_dataset, config)
+                tracker.scalar(f'early_stopping/ch{_channel}/psnr', epoch_psnr, i_epoch + 1)
+                tracker.scalar(f'early_stopping/ch{_channel}/compression_ratio', epoch_cr, i_epoch + 1)
+                print(f"  merge{_n_ch}ch epoch {i_epoch + 1} "
+                      f"monitor_psnr={epoch_psnr:.3f} monitor_cr={epoch_cr:.2f}", flush=True)
+                return epoch_psnr
         merge_losses = train_one(
             new_merged, decoder_params, dataloader, device, config,
             total_steps_merged, config.epochs_merged[i_channel], f"merge{n_ch}ch",
             lam=0.0, max_lr=config.md_max_lr[i_channel], lr_pow=config.md_lr_pow[i_channel],
+            tracker=tracker, epoch_evaluator=epoch_evaluator, early_stopper=early_stopper,
         )
         train_losses.append(merge_losses)
 
@@ -445,9 +709,12 @@ def main():
         mean_psnr, mean_cr = validate(merged, device, val_dataset, config)
         valid_psnr.append(mean_psnr)
         valid_cr.append(mean_cr)
+        tracker.scalar('validation/psnr', mean_psnr, i_channel + 1)
+        tracker.scalar('validation/compression_ratio', mean_cr, i_channel + 1)
+        tracker.scalar('validation/bpp', 24.0 / mean_cr, i_channel + 1)
         print(f"[ch{i_channel}] val psnr={mean_psnr:.2f} dB  cr={mean_cr:.2f}", flush=True)
 
-        torch.save({
+        checkpoint_payload = {
             'i_channel': i_channel,
             'config': config,
             'train_losses': train_losses,
@@ -455,7 +722,9 @@ def main():
             'valid_cr': valid_cr,
             'single_channel_weights': single_channel_weights,
             'merged_decoder_weights': merged_decoder_weights,
-        }, config.save_checkpoint_name)
+        }
+        atomic_torch_save(checkpoint_payload, config.save_checkpoint_name)
+        kbest.consider(mean_psnr, i_channel + 1, checkpoint_payload)
 
     total_time = time.time() - t0
 
@@ -469,7 +738,11 @@ def main():
     try:
         bd_avif = bd.bd_rate(r_avif, d_avif, r_rae_p.tolist(), d_rae_p.tolist(),
                              method='pchip', require_matching_points=False, min_overlap=0.15)
-        print(f"  BD-rate vs AVIF: {bd_avif:+.1f}%", flush=True)
+        if np.isfinite(bd_avif):
+            print(f"  BD-rate vs AVIF: {bd_avif:+.1f}%", flush=True)
+        else:
+            bd_avif = None
+            print("  BD-rate vs AVIF: unavailable (insufficient overlapping points)", flush=True)
     except Exception as e:
         bd_avif = None
         print(f"  BD-rate vs AVIF: failed ({e})", flush=True)
@@ -484,9 +757,13 @@ def main():
         'bd_avif': bd_avif,
         'total_time_hours': total_time / 3600,
     }
-    results_path = config.save_checkpoint_name.replace('.pth', '_results.json')
-    with open(results_path, 'w') as f:
-        json.dump(results, f, indent=2)
+    if config.save_checkpoint_name.endswith('.pth.tar'):
+        results_path = config.save_checkpoint_name[:-8] + '_results.json'
+    elif config.save_checkpoint_name.endswith('.pth'):
+        results_path = config.save_checkpoint_name[:-4] + '_results.json'
+    else:
+        results_path = config.save_checkpoint_name + '_results.json'
+    atomic_json_dump(results, results_path)
 
     print(f"\n{'='*60}")
     print(f"  FINISHED")
@@ -495,6 +772,7 @@ def main():
     print(f"  Total time: {total_time/3600:.2f} hours")
     print(f"  Results saved to {results_path}")
     print(f"{'='*60}\n", flush=True)
+    tracker.close()
 
 
 if __name__ == '__main__':

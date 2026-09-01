@@ -1,5 +1,5 @@
 [workspace]
-authors = ["yuki-inaho"]
+authors = ["FRAPPE contributors"]
 channels = ["conda-forge"]
 description = "FRAPPE: Full-Input Residual-Output Autoencoding with Projection Pursuit Encoders"
 name = "FRAPPE"
@@ -16,6 +16,11 @@ jupyterlab = "*"
 
 [tasks]
 train = "python train_rae_progressive.py"
+train-managed = "python train_managed.py"
+prepare-data = "python tools/prepare_rgb_dataset.py"
+resize-data = "python tools/resize_rgb_dataset.py"
+test = "pytest -q"
+tensorboard = "tensorboard --logdir runs"
 notebook = "jupyter lab FRAPPE.ipynb"
 
 [pypi-dependencies]
@@ -28,3 +33,7 @@ safetensors = "*"
 bjontegaard = "*"
 pillow-jpls = "*"
 livecodec = "*"
+hydra-core = "*"
+tensorboard = "*"
+pytest = "*"
+albumentations = "*"

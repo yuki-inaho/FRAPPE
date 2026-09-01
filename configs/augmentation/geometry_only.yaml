@@ -1,0 +1,12 @@
+# Keep the resolution/crop policy but disable colour/orientation augmentation.
+min_aspect: 1.3333333333
+max_aspect: 1.3333333333
+min_size: 480
+max_size: 480
+min_width: 640
+max_width: 640
+validation_height: 480
+validation_width: 640
+min_scale: 1.0
+max_scale: 2.0
+transforms: []

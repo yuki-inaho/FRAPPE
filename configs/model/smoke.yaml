@@ -1,0 +1,15 @@
+input_channels: 3
+ps: [32, 32, 32, 16, 16, 16, 8, 8, 8]
+decoder_ps: 32
+decoder_dim: 768
+decoder_kernel_size: 3
+decoder_arch: CCCCCC
+decoder_mlp_ratio: 4.0
+decoder_layerscale: false
+decoder_layerscale_init: 1.0e-6
+encoder_arch: SC8
+linear_input: false
+# Measured at 640×480 with exclusive RTX 5090 access, AMUSE, and EMA=0.99.
+# Batch 368 fit but 384 OOMed; 288 preserves useful merged-decoder headroom.
+recommended_batch_size: 288
+recommended_num_workers: 2

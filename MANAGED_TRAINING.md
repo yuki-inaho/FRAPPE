@@ -1,0 +1,225 @@
+# Managed training on anonymous local RGB data
+
+This workflow keeps the paper's `train_rae_progressive.py` command-line
+interface available while adding a Hydra entry point, TensorBoard logging,
+atomic checkpoints, and K-best retention.
+
+## 1. Prepare the dataset
+
+Do not put source archive names in a repository config or command log. Supply
+the four local paths through private shell variables, in the intended
+`dataset_001` through `dataset_004` order:
+
+```bash
+pixi run prepare-data "$ARCHIVE_1" "$ARCHIVE_2" "$ARCHIVE_3" "$ARCHIVE_4" \
+  --output /home/kasm-user/Desktop/data/frappe_rgb
+```
+
+The tool streams only Color/RGB members from ZIP/TAR files, decodes them into
+fresh RGB objects, and writes metadata-free PNG files with anonymous sequential
+names. Raw archive paths and member names are not persisted. The generated
+Hugging Face ImageFolder layout is:
+
+```text
+/home/kasm-user/Desktop/data/frappe_rgb/imagefolder/
+├── train/
+├── validation/
+└── test/
+```
+
+The canonical per-source copies use generic `dataset_001` through
+`dataset_004` identifiers. ImageFolder views are hard links, so they do not
+duplicate the PNG payloads. Then generate the fixed-size dataset used by the
+managed configuration:
+
+```bash
+pixi run resize-data
+```
+
+This preserves the anonymous 800×600 source dataset and creates
+`/home/kasm-user/Desktop/data/frappe_rgb_640x480/imagefolder`. Each fresh PNG
+is RGB, metadata-free, anonymously named, and physically resized with bicubic
+interpolation to width 640 × height 480. Both dimensions divide by the default
+maximum patch size (32), so neither training nor validation crops away rows or
+columns.
+
+## 2. Run a bounded GPU smoke test
+
+```bash
+pixi run train-managed \
+  run.id=smoke_001 \
+  'model.ps=[32]' \
+  model.decoder_ps=32 \
+  model.decoder_dim=64 \
+  model.decoder_arch=C \
+  'training.epochs_single=[1]' \
+  'training.epochs_merged=[1]' \
+  training.dataset_samples=1 \
+  training.validation_samples=1 \
+  training.batch_size=1 \
+  training.max_batches_per_epoch=1 \
+  training.num_workers=0 \
+  checkpoint.keep_best_k=1
+```
+
+Remove the sample and batch limits for a real run.
+
+## 3. Train the documented nine-channel smoke architecture
+
+```bash
+pixi run train-managed run.id=progressive_9ch_001
+```
+
+## 4. Train the released 21-channel architecture
+
+```bash
+pixi run train-managed model=progressive_21ch run.id=progressive_21ch_001
+```
+
+The 21-channel preset matches the released model architecture. It does not
+claim exact paper-training reproduction because the complete per-channel
+lambda, learning-rate, and epoch invocation was not published. Override those
+lists only after a small pilot study.
+
+## AMUSE and EMA
+
+AMUSE is vendored from the official Apache-2.0 implementation at a pinned
+commit because its repository is not an installable Python package. It is the
+managed-training default with an EMA of 0.99; select it explicitly when needed:
+
+```bash
+pixi run train-managed \
+  experiment=amuse_ema \
+  run.id=amuse_001
+```
+
+For the historical Adan behavior, use `experiment=managed` or set
+`optimization.optimizer=adan` and `optimization.ema_decay=0.0`.
+
+AMUSE is schedule-free: its internal warmup is controlled by
+`optimization.amuse_warmup_ratio`, and the Adan cosine controls
+`sc_lr_pow`/`md_lr_pow` do not apply. Matrix/convolution weights use the
+official Muon update; scalar and vector parameters use the configured AMUSE
+auxiliary update (`adamw` by default).
+
+The managed default batches were measured at 640×480 on the exclusively
+assigned RTX 5090, including AMUSE optimizer state and EMA:
+
+| preset | selected batch | measured safe VRAM use |
+| --- | ---: | ---: |
+| `model=smoke` (9 channels) | 288 | 27.1 GiB reserved |
+| `model=progressive_21ch` | 12 | 26.1 GiB reserved |
+
+The 9-channel profile fit batch 368 but batch 384 OOMed. The 21-channel
+profile fit batch 14 narrowly and batch 15 OOMed; defaults intentionally leave
+headroom. Re-measure after changing architecture, image size, optimizer, EMA,
+or GPU:
+
+```bash
+pixi run python tools/benchmark_batch_size.py \
+  --profile managed_9ch --height 480 --width 640 --candidates 256 288 320 352 384
+```
+
+## Data augmentation
+
+The network input is always width 640 × height 480. Resize/crop geometry and
+Albumentations transforms are selected as a Hydra configuration group, so
+augmentation settings are captured in each run's Hydra output and
+`run_metadata.json`.
+
+| profile | use | transforms |
+| --- | --- | --- |
+| `rgb_default` | default natural RGB training | color jitter, HSV/RGB colour shifts, channel shuffle, H/V flips, gamma |
+| `rgb_strong` | orientation/colour order are not semantically fixed | stronger colour changes, channel shuffle, H/V flips, occasional gray |
+| `geometry_only` | disable colour/orientation DA | only resize and random crop |
+
+For example:
+
+```bash
+pixi run train-managed augmentation=rgb_strong run.id=rgb_strong_001
+pixi run train-managed augmentation=geometry_only run.id=geometry_only_001
+pixi run train-managed augmentation.transforms.channel_shuffle.p=0.25 run.id=shuffle_025
+```
+
+Supported transform names are `ColorJitter`, `HueSaturationValue`, `RGBShift`,
+`ChannelShuffle`, `HorizontalFlip`, `VerticalFlip`, `RandomGamma`, `ToGray`,
+and `ToSepia`. Profiles live in `configs/augmentation/`; invalid transform
+names or parameters fail before the dataset/GPU training loop starts.
+
+## Epoch control
+
+FRAPPE trains each progressive channel in two explicit epoch-based phases.
+Set the number of epochs per channel with lists; a shorter list repeats its
+final value for later channels:
+
+```bash
+pixi run train-managed \
+  'training.epochs_single=[2,2,3]' \
+  'training.epochs_merged=[4,4,5]' \
+  run.id=epoch_control_001
+```
+
+TensorBoard records an aggregate loss for every completed phase epoch. The
+channel-level `last.pth.tar` remains the valid resume boundary because a new
+channel's encoder and merged decoder must be committed together.
+
+## Early stopping
+
+Early stopping is enabled by default for the merged-decoder phase. At each
+epoch it measures PSNR on a fixed first 128-image validation subset and stops
+after two non-improving epochs (`min_delta=0.01 dB`, with at least two epochs).
+The best raw model and its EMA state are restored before full validation and
+checkpointing. It is intentionally per-channel: `last.pth.tar` still remains
+the completed-channel resume boundary.
+
+```bash
+pixi run train-managed early_stopping.enabled=false run.id=fixed_epochs_001
+pixi run train-managed early_stopping.patience=4 early_stopping.samples=256 run.id=patience_4
+```
+
+## Checkpoints and resumption
+
+Each managed run writes:
+
+```text
+runs/<run-id>/
+├── checkpoints/
+│   ├── last.pth.tar
+│   └── best/
+│       ├── index.json
+│       └── best_step*.pth.tar
+├── tensorboard/
+└── run_metadata.json
+```
+
+`last.pth.tar` is the channel-level resume checkpoint. K-best entries are ranked
+by validation PSNR and are kept separately. FRAPPE resumption continues by
+adding channels; it is not conventional fine-tuning of already completed
+channels.
+
+To resume, set both values:
+
+```bash
+pixi run train-managed \
+  run.id=progressive_21ch_001 \
+  checkpoint.resume_checkpoint=/path/to/last.pth.tar \
+  checkpoint.resume_channels=NUMBER
+```
+
+## TensorBoard
+
+```bash
+pixi run tensorboard
+```
+
+Open the displayed local URL. Training loss, rate proxy, learning rate,
+gradient norm, validation PSNR, compression ratio, and bpp are recorded.
+
+## Tests
+
+```bash
+pixi run test
+```
+
+Tests use synthetic images and archives. Private training images are never
+copied into the repository.
