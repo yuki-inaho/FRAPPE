@@ -1,0 +1,30 @@
+[workspace]
+authors = ["yuki-inaho"]
+channels = ["conda-forge"]
+description = "FRAPPE: Full-Input Residual-Output Autoencoding with Projection Pursuit Encoders"
+name = "FRAPPE"
+platforms = ["linux-64"]
+
+[dependencies]
+python = "3.12.*"
+numpy = "*"
+pillow = "*"
+sympy = "*"
+einops = "*"
+matplotlib = "*"
+jupyterlab = "*"
+
+[tasks]
+train = "python train_rae_progressive.py"
+notebook = "jupyter lab FRAPPE.ipynb"
+
+[pypi-dependencies]
+torch = { version = ">=2.7.0", index = "https://download.pytorch.org/whl/cu128" }
+torchvision = { version = ">=0.22.0", index = "https://download.pytorch.org/whl/cu128" }
+timm = "*"
+datasets = "*"
+huggingface_hub = "*"
+safetensors = "*"
+bjontegaard = "*"
+pillow-jpls = "*"
+livecodec = "*"

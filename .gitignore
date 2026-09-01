@@ -1,4 +1,5 @@
 .ipynb_checkpoints/
+.pixi/
 __pycache__/
 _build/
 docs/.buildinfo
