@@ -19,15 +19,22 @@ def get_scale_groups(ps_list, n_ch):
 
 
 def adapt_to_decoder(z, encoder_ps, decoder_ps):
-    """Adapt encoder latent resolution to decoder resolution."""
+    """Adapt encoder latent resolution to decoder resolution.
+
+    The space-to-depth branch uses ``pixel_unshuffle`` rather than an einops
+    ``rearrange``. The two are bit-identical -- both order the output channels
+    as ``c * f^2 + p1 * f + p2``, which ``tests`` asserts -- but einops resolves
+    the spatial extent from the tensor it is given, so under ONNX tracing it
+    emits a Reshape with the traced height and width baked in and the exported
+    decoder then only accepts the one image size it was traced at.
+    """
     if encoder_ps == decoder_ps:
         return z
     elif encoder_ps < decoder_ps:
-        f = decoder_ps // encoder_ps
-        return rearrange(z, 'b c (h p1) (w p2) -> b (c p1 p2) h w', p1=f, p2=f)
+        return F.pixel_unshuffle(z, decoder_ps // encoder_ps)
     else:
         f = encoder_ps // decoder_ps
-        return F.interpolate(z, scale_factor=f, mode='nearest')
+        return z.repeat_interleave(f, dim=-2).repeat_interleave(f, dim=-1)
 
 
 def decoder_channels_per_encoder(encoder_ps, decoder_ps):

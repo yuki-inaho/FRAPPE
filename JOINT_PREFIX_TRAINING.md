@@ -128,6 +128,60 @@ That prints the full prefix rate-distortion ladder, the number of monotonicity
 violations, and the largest marginal gain, with every bitrate measured from a
 real bitstream.
 
+## ONNX export
+
+```bash
+pixi run export-onnx \
+  --checkpoint runs/joint_21ch_001/checkpoints/last.pth.tar \
+  --output-stem runs/joint_21ch_001/onnx/frappe \
+  --report runs/joint_21ch_001/onnx/report.json
+```
+
+Two graphs come out, split exactly at the entropy coder rather than one step
+before it. The paper describes the bitstream as "reshape each scale to a single
+2D grayscale plane `(n_s * T1/p_s, T2/p_s)` and apply length-prefixed JPEG-LS",
+and `entropy_coding.py` implements that as a reshape of the `(1, C, H, W)` latent
+to `(C*H, W)` followed by a shift of the signed codes into `uint8`. Both are pure
+tensor operations, so both live inside the graph:
+
+| graph | input | output |
+| --- | --- | --- |
+| `*_encoder.onnx` | `image (1, 3, 32·h, 32·w) uint8` | one `uint8` plane per scale, `(1, n_s·32·h/p_s, 32·w/p_s)` |
+| `*_decoder.onnx` | the same planes | `reconstruction (1, 3, 32·h, 32·w) uint8` |
+
+The encoder's outputs are literally the grayscale images JPEG-LS consumes, so a
+deployment has no arithmetic left to get wrong between the model and the coder.
+What stays outside is JPEG-LS itself and its 4-byte length prefix — a byte-exact
+standard codec and a container, not arithmetic. `--io float` gives the
+research-facing form instead: `[-1, 1]` images and signed `int8` planes, same
+layout.
+
+Height and width are genuinely dynamic. Sizes are carried in units of the largest
+patch size because the non-overlapping analysis admits no finer granularity, and
+the shapes appear in the graph as the paper's own relation:
+
+```
+image        UINT8  [1, 3, '32*units_h', '32*units_w']
+plane_p32    UINT8  [1,    'units_h',       'units_w']
+plane_p16    UINT8  [1, '10*units_h',    '2*units_w']
+plane_p2     UINT8  [1, '16*units_h',   '16*units_w']
+```
+
+The batch axis is fixed at one: the model specialises it, and an image codec
+encodes one image at a time.
+
+The tool verifies rather than declares. The encoder's planes must be
+byte-identical to `entropy_coding.arrange_latents` plus the shift, the JPEG-LS
+payloads they produce must be byte-identical to the reference bitstream, and both
+graphs are then re-run at 96×64, 480×320, 800×608 and 1920×1088 — a graph that
+only works at the size it was traced at is the failure this export exists to
+avoid. The decoder is allowed one code level of difference on a handful of
+pixels, because it reduces channels in a different order than PyTorch does and a
+float32 value on a rounding boundary lands on either side of it; anything larger
+or widespread fails the export.
+
+`--no-simplify` skips the onnx-simplifier pass.
+
 ## Warm-starting from a stagewise checkpoint
 
 `warm_start_from_merged` lifts a `MergedAutoencoder` trained on the first `n`

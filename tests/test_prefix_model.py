@@ -360,3 +360,31 @@ def test_average_ranks_averages_ties():
     assert list(ranks) == [2.5, 0.0, 2.5, 1.0]
     constant = average_ranks(np.array([5.0, 5.0, 5.0]))
     assert list(constant) == [1.0, 1.0, 1.0]
+
+
+@pytest.mark.parametrize("encoder_ps,decoder_ps", [(2, 8), (4, 8), (8, 8), (16, 8), (32, 8)])
+def test_adapt_to_decoder_matches_the_einops_formulation(encoder_ps, decoder_ps):
+    """The ONNX-friendly rewrite of adapt_to_decoder must be bit-identical.
+
+    einops resolves the spatial extent from the tensor, which bakes the traced
+    image size into the exported graph; pixel_unshuffle and repeat_interleave do
+    not. They are only an acceptable substitution if they agree exactly.
+    """
+    import torch.nn.functional as functional
+    from einops import rearrange
+
+    from src.compressors.frappe.ops import adapt_to_decoder
+
+    torch.manual_seed(11)
+    grid = 6
+    z = torch.randn(2, 3, grid * max(1, decoder_ps // encoder_ps),
+                    grid * max(1, decoder_ps // encoder_ps))
+    if encoder_ps < decoder_ps:
+        f = decoder_ps // encoder_ps
+        expected = rearrange(z, "b c (h p1) (w p2) -> b (c p1 p2) h w", p1=f, p2=f)
+    elif encoder_ps > decoder_ps:
+        expected = functional.interpolate(z, scale_factor=encoder_ps // decoder_ps,
+                                          mode="nearest")
+    else:
+        expected = z
+    assert torch.equal(adapt_to_decoder(z, encoder_ps, decoder_ps), expected)
