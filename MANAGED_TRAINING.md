@@ -120,6 +120,25 @@ pixi run python tools/evaluate_local_checkpoint.py \
   --dataset-root /workspace/data/frappe_rgb_800x608/imagefolder
 ```
 
+### Five-hour 21-channel run without EMA
+
+The calibrated no-EMA run uses the same released 21-channel/five-scale model,
+12-block LayerScale decoder and 800×608 data.  It disables early stopping,
+uses batch 8 (batch 10 OOMed in the 800×608 preflight), and loads shuffled
+batches with eight worker processes:
+
+```bash
+pixi run train-managed \
+  experiment=iteration_21ch_5h_noema \
+  run.id=progressive_21ch_800x608_5h_noema_001
+```
+
+Its fixed budget is 750 single-channel plus 1,700 merged-decoder updates per
+channel (51,450 total).  The preflight measured 0.317 seconds of GPU work per
+full-model update; the five-hour estimate includes PNG loading,
+Albumentations, validation, and cumulative checkpoint writes.  The training
+DataLoader has deterministic `shuffle=True` in every phase.
+
 ## Exporting a reconstructed validation image
 
 Export an anonymous validation sample without copying its source filename into

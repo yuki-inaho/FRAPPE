@@ -5,11 +5,10 @@
 # when the GPU is available.  It selects the released 21-channel architecture
 # and the separately materialized 800x608 anonymous RGB data.
 #
-# 21 channels x (100 single + 220 merged) = 6,720 optimizer updates.  At
-# 800x608, the 12-block decoder_ps=8 architecture is expected to take about
-# 4.0--4.5 seconds/update at batch 12 on the exclusive RTX 5090: roughly
-# 7.5--8.4 hours, plus bounded validation.  Actual wall time is
-# hardware/data-loader dependent.
+# This older preset keeps its original update budget.  The later 800x608
+# no-EMA preflight found that batch 8 is safe (27.35 GiB reserved) while batch
+# 10 OOMs, so override the model's 640x480 recommendation here.  Use
+# iteration_21ch_5h_noema for the currently calibrated long run.
 defaults:
   - override /model: progressive_21ch
   - override /data: anonymous_rgb_800x608
@@ -27,6 +26,8 @@ optimization:
 training:
   iterations_single: [100]
   iterations_merged: [220]
+  batch_size: 8
+  num_workers: 8
   # Bounded validation keeps the long progressive run within its time budget.
   # Run tools/evaluate_local_checkpoint.py without --samples after completion
   # to report the full validation/test metrics.

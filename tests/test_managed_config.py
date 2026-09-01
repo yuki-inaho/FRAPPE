@@ -61,7 +61,33 @@ def test_21ch_eight_hour_preset_selects_its_model_data_and_geometry() -> None:
         cfg = compose(config_name="config", overrides=["experiment=iteration_21ch_8h"])
     assert len(cfg.model.ps) == 21
     assert cfg.model.recommended_batch_size == 12
+    assert cfg.training.batch_size == 8
+    assert cfg.training.num_workers == 8
     assert cfg.data.root.endswith("data/frappe_rgb_800x608/imagefolder")
     assert (cfg.augmentation.validation_width, cfg.augmentation.validation_height) == (800, 608)
     assert cfg.training.iterations_single == [100]
     assert cfg.training.iterations_merged == [220]
+
+
+def test_21ch_five_hour_noema_preset_is_full_scale_and_multicore() -> None:
+    config_dir = str(Path(__file__).parents[1] / "configs")
+    with initialize_config_dir(version_base=None, config_dir=config_dir):
+        cfg = compose(config_name="config", overrides=[
+            "experiment=iteration_21ch_5h_noema",
+        ])
+    assert cfg.model.ps == [
+        32, 32, 32,
+        16, 16, 16, 16, 16, 16,
+        8, 8, 8,
+        4, 4, 4, 4, 4, 4,
+        2, 2, 2,
+    ]
+    assert cfg.model.decoder_ps == 8
+    assert cfg.model.decoder_arch == "CCCCCCCCCCCC"
+    assert cfg.model.decoder_layerscale is True
+    assert cfg.optimization.ema_decay == 0.0
+    assert cfg.training.batch_size == 8
+    assert cfg.training.num_workers == 8
+    assert cfg.training.iterations_single == [750]
+    assert cfg.training.iterations_merged == [1700]
+    assert cfg.early_stopping.enabled is False

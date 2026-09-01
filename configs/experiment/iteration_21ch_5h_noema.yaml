@@ -1,0 +1,44 @@
+# @package _global_
+#
+# Five-hour-class progressive training on the 800x608 anonymous RGB dataset.
+# This uses the released 21-channel, five-scale architecture with its 12-block
+# LayerScale decoder.  EMA and early stopping are disabled so short-history
+# averaged/random-initialized weights cannot replace the trained weights.
+#
+# RTX 5090 preflight at 800x608 (AMUSE, no EMA): batch 8 reserves 27.35 GiB;
+# batch 10 OOMs.  The full 21-channel merged step measured 0.317 s of GPU time.
+# 21 x (750 + 1700) = 51,450 optimizer updates, targeting about five hours once
+# PNG loading, Albumentations, validation and cumulative checkpoint I/O are
+# included.  Wall time remains data-loader and filesystem dependent.
+defaults:
+  - override /model: progressive_21ch
+  - override /data: anonymous_rgb_800x608
+  - override /augmentation: rgb_800x608
+  - _self_
+
+experiment:
+  name: iteration_21ch_5h_noema
+  expected_wall_time_hours: 5
+
+optimization:
+  optimizer: amuse
+  ema_decay: 0.0
+
+training:
+  iterations_single: [750]
+  iterations_merged: [1700]
+  batch_size: 8
+  # Eight workers decode/augment concurrently; the DataLoader itself uses
+  # deterministic shuffle=True for every single/merged phase.
+  num_workers: 8
+  validation_samples: 128
+
+# Required by the fixed-iteration CLI but unused while early stopping is off.
+validation:
+  every_iterations: 425
+
+early_stopping:
+  enabled: false
+
+checkpoint:
+  keep_best_k: 3
