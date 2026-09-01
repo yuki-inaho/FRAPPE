@@ -5,6 +5,10 @@
 experiment:
   name: iteration_trial_30m
 
+optimization:
+  optimizer: amuse
+  ema_decay: 0.99
+
 model:
   ps: [32]
 
