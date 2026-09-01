@@ -12,11 +12,19 @@ from __future__ import annotations
 import argparse
 import gc
 import json
+import sys
 import time
 from pathlib import Path
 
 import datasets
 import torch
+
+# Executing ``python tools/evaluate_local_checkpoint.py`` puts ``tools/`` on
+# sys.path rather than the repository root.  Make the documented invocation
+# self-contained so the frozen training validator can be reused directly.
+REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
+if str(REPOSITORY_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPOSITORY_ROOT))
 
 from train_rae_progressive import validate
 from src.compressors.frappe.model import MergedAutoencoder
