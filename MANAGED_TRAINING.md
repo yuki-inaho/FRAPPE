@@ -86,10 +86,11 @@ lists only after a small pilot study.
 
 The 21-channel long-run preset selects the released architecture, the
 separately materialized anonymous 800×608 ImageFolder, AMUSE, and EMA=0.99.
-It is fixed-update based: 150 single-channel plus 350 merged-decoder updates
-per channel (10,500 updates total). On the exclusive RTX 5090 this is planned
-as an approximately eight-hour run; actual duration depends on hardware and
-data-loader throughput. It does not begin merely by creating the configuration.
+It is fixed-update based: 100 single-channel plus 220 merged-decoder updates
+per channel (6,720 updates total). On the exclusive RTX 5090 this is planned
+as an approximately eight-hour run at 800×608; actual duration depends on
+hardware and data-loader throughput. It does not begin merely by creating the
+configuration.
 
 First prepare the data once (the source is already anonymous RGB PNG data):
 
