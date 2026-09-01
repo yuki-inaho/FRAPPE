@@ -1,0 +1,37 @@
+# @package _global_
+# Time-boxed nine-channel run on the 640x480 anonymous RGB dataset.
+#
+# The measured RTX 5090 throughput is about 2.2--2.6 seconds per optimizer
+# update at this resolution.  Fifty single-channel plus one hundred
+# merged-decoder updates per channel therefore targets roughly one hour for
+# all nine channels, including fixed-subset validation.  This is a bounded
+# engineering run, not the paper's multi-epoch reproduction.
+experiment:
+  name: iteration_9ch_1h
+
+model:
+  ps: [32, 32, 32, 16, 16, 16, 8, 8, 8]
+
+optimization:
+  optimizer: amuse
+  ema_decay: 0.99
+
+training:
+  iterations_single: [50]
+  iterations_merged: [100]
+  # Keep the training loop time-bounded; a separate post-run evaluator uses
+  # the complete validation and test splits for the reported metrics.
+  validation_samples: 128
+
+validation:
+  every_iterations: 50
+
+early_stopping:
+  enabled: true
+  patience: 3
+  min_delta: 0.01
+  min_epochs: 2
+  samples: 64
+
+checkpoint:
+  keep_best_k: 3
