@@ -53,6 +53,9 @@ training:
   dataset_samples: null
   validation_samples: null
   max_batches_per_epoch: null
+  # 'zero_expand' preserves the previous prefix function exactly when a channel
+  # is added; 'none' reproduces the published scratch reinitialisation.
+  decoder_warm_start: zero_expand
   merged_decoder_noise: false
   merged_decoder_round: true
 

@@ -87,6 +87,7 @@ def build_argv(cfg: DictConfig) -> list[str]:
             OmegaConf.to_container(cfg.augmentation, resolve=True),
             separators=(",", ":"), sort_keys=True,
         ),
+        "--decoder_warm_start": cfg.training.decoder_warm_start,
         "--merged_decoder_noise": cfg.training.merged_decoder_noise,
         "--merged_decoder_round": cfg.training.merged_decoder_round,
         "--train_ds": cfg.data.root,

@@ -163,6 +163,34 @@ To inspect what a reported PSNR means visually, use `--target-psnr 14.0` in
 place of `--index 0`.  This scans the split and exports the image closest to
 14.0 dB; the sidecar metadata records the chosen anonymous index and exact PSNR.
 
+## Merged-decoder warm start
+
+When a channel is added, the published script builds a fresh
+`MergedAutoencoder` and trains its decoder from scratch, so every channel pays
+for relearning a decoder that already worked. `training.decoder_warm_start`
+controls that:
+
+| value | behaviour |
+| --- | --- |
+| `none` | reinitialise the merged decoder (the published behaviour) |
+| `copy` | reuse the previous decoder, leave the new input columns at their random init |
+| `zero_expand` | reuse it and zero the new input columns (managed default) |
+
+`zero_expand` widens the first decoder convolution with zero columns, which
+leaves the previous prefix's function bit-identical at the moment of widening
+regardless of what the new encoder emits — the new channel starts from a working
+codec instead of from noise.
+`tests/test_prefix_model.py::test_stagewise_widening_preserves_the_previous_prefix_exactly`
+asserts that equality. The direct CLI keeps `none` so the published behaviour is
+still reachable without a flag:
+
+```bash
+pixi run train-managed training.decoder_warm_start=none run.id=published_behaviour
+```
+
+For training that abandons the channel-at-a-time schedule altogether, see
+[JOINT_PREFIX_TRAINING.md](JOINT_PREFIX_TRAINING.md).
+
 ## AMUSE and EMA
 
 AMUSE is vendored from the official Apache-2.0 implementation at a pinned

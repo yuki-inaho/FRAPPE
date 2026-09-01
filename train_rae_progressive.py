@@ -35,6 +35,7 @@ from src.compressors.frappe.experiment import (
     atomic_json_dump,
     atomic_torch_save,
 )
+from src.compressors.frappe.prefix import zero_expand_first_conv
 from src.compressors.frappe.third_party.amuse import AMUSE
 
 
@@ -378,6 +379,13 @@ def parse_args(argv=None):
     p.add_argument('--amuse_weight_decay_at_y', type=float, default=0.0)
     p.add_argument('--amuse_aux_update_type', type=str, choices=['adamw', 'sgd'], default='adamw')
     p.add_argument('--amuse_muon_min_ndim', type=int, default=2)
+    p.add_argument('--decoder_warm_start', type=str, default='none',
+                   choices=['none', 'copy', 'zero_expand'],
+                   help="how the merged decoder is initialised when a channel is added: "
+                        "'none' reinitialises it from scratch (the published behaviour), "
+                        "'copy' reuses the previous weights and leaves the new input columns "
+                        "random, 'zero_expand' zeroes them so the previous function is "
+                        "preserved exactly at the moment of widening")
     p.add_argument('--early_stopping', type=lambda s: s.lower() in ('true','1','yes'), default=False)
     p.add_argument('--early_stopping_patience', type=int, default=2)
     p.add_argument('--early_stopping_min_delta', type=float, default=0.01)
@@ -712,6 +720,24 @@ def main(argv=None):
         # Merge new channel's encoder
         ch_in_scale = i_channel - new_groups[current_scale_idx][1]
         merge_encoder(new_merged, single, current_scale_idx, ch_in_scale)
+
+        # Carry the previous merged decoder forward instead of relearning it.
+        # Widening the first convolution with zero columns leaves the previous
+        # prefix function bit-identical at the moment of widening, so the new
+        # channel starts from a working codec rather than from noise.
+        if merged is not None and config.decoder_warm_start != 'none':
+            with torch.no_grad():
+                old_first, new_first = merged.decoder[0], new_merged.decoder[0]
+                if config.decoder_warm_start == 'zero_expand':
+                    zero_expand_first_conv(old_first, new_first)
+                else:
+                    old_ch = old_first.weight.shape[1]
+                    new_first.weight[:, :old_ch].copy_(old_first.weight)
+                    new_first.bias.copy_(old_first.bias)
+                for target, source in zip(list(new_merged.decoder)[1:],
+                                          list(merged.decoder)[1:]):
+                    target.load_state_dict(source.state_dict())
+            print(f"  merged decoder warm start: {config.decoder_warm_start}", flush=True)
 
         # Free old models
         del single
