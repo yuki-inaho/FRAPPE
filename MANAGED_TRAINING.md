@@ -139,6 +139,10 @@ For a non-cherry-picked representative sample, replace `--index 0` with
 `--representative`.  It scores the requested split and chooses the image whose
 per-image PSNR is closest to the split median.
 
+To inspect what a reported PSNR means visually, use `--target-psnr 14.0` in
+place of `--index 0`.  This scans the split and exports the image closest to
+14.0 dB; the sidecar metadata records the chosen anonymous index and exact PSNR.
+
 ## AMUSE and EMA
 
 AMUSE is vendored from the official Apache-2.0 implementation at a pinned

@@ -67,6 +67,12 @@ def validated_image(image: PIL.Image.Image, config) -> PIL.Image.Image:
     return image
 
 
+def image_psnr(reference: torch.Tensor, reconstruction: torch.Tensor) -> float:
+    """Report PSNR in conventional [0, 1] image-intensity units."""
+    mse = F.mse_loss((reference + 1.0) / 2.0, (reconstruction + 1.0) / 2.0).item()
+    return -10.0 * math.log10(mse)
+
+
 def reconstruct(model: MergedAutoencoder, image: PIL.Image.Image, config, device: str):
     """Return normalized reference/reconstruction tensors and their PSNR."""
     reference = pil_to_tensor(image).to(torch.float32).unsqueeze(0).to(device)
@@ -76,7 +82,9 @@ def reconstruct(model: MergedAutoencoder, image: PIL.Image.Image, config, device
         latents = model.encode(model_input)
         latents = [latent.round().clamp(-127, 127).to(torch.int8) for latent in latents]
         reconstructed = model.decode(latents).clamp(-1, 1)
-    psnr = -10.0 * math.log10(F.mse_loss(reference, reconstructed).item())
+    # Match train_rae_progressive.validate: PSNR is conventionally reported
+    # after mapping model tensors from [-1, 1] to image intensities [0, 1].
+    psnr = image_psnr(reference, reconstructed)
     return reference, reconstructed, psnr
 
 
@@ -89,8 +97,15 @@ def select_median_psnr_index(scores: list[float]) -> tuple[int, float]:
     return index, median
 
 
-def find_representative(dataset, model: MergedAutoencoder, config, device: str) -> tuple[int, float]:
-    """Score a split and return its median-quality image without filenames."""
+def select_target_psnr_index(scores: list[float], target: float) -> int:
+    """Choose the lowest-index image whose PSNR is nearest ``target``."""
+    if not scores:
+        raise ValueError("cannot select an image from an empty split")
+    return min(range(len(scores)), key=lambda i: (abs(scores[i] - target), i))
+
+
+def score_split(dataset, model: MergedAutoencoder, config, device: str) -> list[float]:
+    """Return per-image PSNRs for a split without exposing source filenames."""
     scores = []
     for index, sample in enumerate(dataset):
         image = validated_image(sample["image"], config)
@@ -98,7 +113,7 @@ def find_representative(dataset, model: MergedAutoencoder, config, device: str) 
         scores.append(psnr)
         if (index + 1) % 500 == 0 or index + 1 == dataset.num_rows:
             print(f"scored {index + 1}/{dataset.num_rows} images", flush=True)
-    return select_median_psnr_index(scores)
+    return scores
 
 
 def save_comparison(reference: PIL.Image.Image, reconstruction: PIL.Image.Image,
@@ -125,6 +140,8 @@ def parse_args() -> argparse.Namespace:
                         help="zero-based index within the requested split")
     selection.add_argument("--representative", action="store_true",
                         help="select the image closest to the split's median per-image PSNR")
+    selection.add_argument("--target-psnr", type=float, default=None,
+                        help="select the image whose per-image PSNR is closest to this value")
     parser.add_argument("--channels", type=int, default=None,
                         help="completed progressive snapshot; default is the final one")
     parser.add_argument("--device", default="cuda:0")
@@ -145,11 +162,16 @@ def main() -> None:
     model = load_snapshot(checkpoint, channels, args.device)
     selection = "index"
     median_psnr = None
+    target_psnr = None
     if args.representative:
-        args.index, median_psnr = find_representative(
-            dataset, model, checkpoint["config"], args.device
-        )
+        scores = score_split(dataset, model, checkpoint["config"], args.device)
+        args.index, median_psnr = select_median_psnr_index(scores)
         selection = "median_per_image_psnr"
+    elif args.target_psnr is not None:
+        scores = score_split(dataset, model, checkpoint["config"], args.device)
+        args.index = select_target_psnr_index(scores, args.target_psnr)
+        target_psnr = args.target_psnr
+        selection = "target_per_image_psnr"
     elif args.index is None:
         args.index = 0
     if not 0 <= args.index < dataset.num_rows:
@@ -176,6 +198,7 @@ def main() -> None:
             "sample_index": args.index,
             "selection": selection,
             "median_PSNR_dB": median_psnr,
+            "target_PSNR_dB": target_psnr,
             "channels": channels,
             "width": image.width,
             "height": image.height,

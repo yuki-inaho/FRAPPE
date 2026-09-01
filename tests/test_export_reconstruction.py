@@ -2,8 +2,14 @@ from types import SimpleNamespace
 
 import pytest
 from PIL import Image
+import torch
 
-from tools.export_local_reconstruction import select_median_psnr_index, validated_image
+from tools.export_local_reconstruction import (
+    image_psnr,
+    select_median_psnr_index,
+    select_target_psnr_index,
+    validated_image,
+)
 
 
 def test_validated_image_uses_checkpoint_validation_dimensions() -> None:
@@ -27,3 +33,16 @@ def test_representative_selection_uses_median_and_stable_tie_breaking() -> None:
 
     assert median == 11.0
     assert index == 1
+
+
+def test_target_selection_uses_stable_tie_breaking() -> None:
+    index = select_target_psnr_index([12.5, 13.5, 14.5], 14.0)
+
+    assert index == 1
+
+
+def test_reported_psnr_uses_zero_to_one_image_intensities() -> None:
+    reference = torch.full((1, 3, 1, 1), -1.0)
+    reconstruction = torch.full((1, 3, 1, 1), 1.0)
+
+    assert image_psnr(reference, reconstruction) == 0.0
