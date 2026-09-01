@@ -82,6 +82,43 @@ claim exact paper-training reproduction because the complete per-channel
 lambda, learning-rate, and epoch invocation was not published. Override those
 lists only after a small pilot study.
 
+## 5. Prepare an 800×608, eight-hour-class 21-channel run
+
+The 21-channel long-run preset selects the released architecture, the
+separately materialized anonymous 800×608 ImageFolder, AMUSE, and EMA=0.99.
+It is fixed-update based: 150 single-channel plus 350 merged-decoder updates
+per channel (10,500 updates total). On the exclusive RTX 5090 this is planned
+as an approximately eight-hour run; actual duration depends on hardware and
+data-loader throughput. It does not begin merely by creating the configuration.
+
+First prepare the data once (the source is already anonymous RGB PNG data):
+
+```bash
+pixi run resize-data \
+  --source /home/kasm-user/Desktop/data/frappe_rgb \
+  --output /home/kasm-user/Desktop/data/frappe_rgb_800x608 \
+  --width 800 --height 608
+```
+
+When ready to occupy the GPU, launch the complete recipe:
+
+```bash
+pixi run train-managed \
+  experiment=iteration_21ch_8h \
+  run.id=progressive_21ch_800x608_001
+```
+
+The preset performs bounded 64-image early-stopping checks and 128-image
+channel validation to preserve the time budget, retains the five best
+channel-level checkpoints, and writes a resume-safe `last.pth.tar`. After the
+run, evaluate the complete validation and test splits with:
+
+```bash
+pixi run python tools/evaluate_local_checkpoint.py \
+  --checkpoint runs/progressive_21ch_800x608_001/checkpoints/last.pth.tar \
+  --dataset-root /home/kasm-user/Desktop/data/frappe_rgb_800x608/imagefolder
+```
+
 ## AMUSE and EMA
 
 AMUSE is vendored from the official Apache-2.0 implementation at a pinned

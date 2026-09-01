@@ -1,0 +1,47 @@
+# The standard natural-RGB augmentation profile at a fixed 800 (W) x 608 (H)
+# network input.  Both dimensions divide by the 21-channel model's maximum
+# patch size (32), so no image content is cropped for patch alignment.
+min_aspect: 1.3157894737
+max_aspect: 1.3157894737
+min_size: 608
+max_size: 608
+min_width: 800
+max_width: 800
+validation_height: 608
+validation_width: 800
+min_scale: 1.0
+max_scale: 2.0
+
+transforms:
+  color_jitter:
+    name: ColorJitter
+    brightness: 0.20
+    contrast: 0.20
+    saturation: 0.20
+    hue: 0.05
+    p: 0.80
+  hue_saturation_value:
+    name: HueSaturationValue
+    hue_shift_limit: 10
+    sat_shift_limit: 20
+    val_shift_limit: 10
+    p: 0.35
+  rgb_shift:
+    name: RGBShift
+    r_shift_limit: 10
+    g_shift_limit: 10
+    b_shift_limit: 10
+    p: 0.20
+  channel_shuffle:
+    name: ChannelShuffle
+    p: 0.10
+  horizontal_flip:
+    name: HorizontalFlip
+    p: 0.50
+  vertical_flip:
+    name: VerticalFlip
+    p: 0.10
+  random_gamma:
+    name: RandomGamma
+    gamma_limit: [90, 110]
+    p: 0.20

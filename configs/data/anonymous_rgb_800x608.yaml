@@ -1,0 +1,3 @@
+# A separately materialized, metadata-free RGB ImageFolder.  The neutral path
+# may be relocated through FRAPPE_DATA_ROOT_800X608 without changing a run.
+root: ${oc.env:FRAPPE_DATA_ROOT_800X608,/home/kasm-user/Desktop/data/frappe_rgb_800x608/imagefolder}

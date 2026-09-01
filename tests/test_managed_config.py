@@ -53,3 +53,15 @@ def test_iteration_trial_preset_is_fixed_update_based() -> None:
     assert cfg.training.iterations_single == [200]
     assert cfg.training.iterations_merged == [500]
     assert cfg.validation.every_iterations == 125
+
+
+def test_21ch_eight_hour_preset_selects_its_model_data_and_geometry() -> None:
+    config_dir = str(Path(__file__).parents[1] / "configs")
+    with initialize_config_dir(version_base=None, config_dir=config_dir):
+        cfg = compose(config_name="config", overrides=["experiment=iteration_21ch_8h"])
+    assert len(cfg.model.ps) == 21
+    assert cfg.model.recommended_batch_size == 12
+    assert cfg.data.root.endswith("data/frappe_rgb_800x608/imagefolder")
+    assert (cfg.augmentation.validation_width, cfg.augmentation.validation_height) == (800, 608)
+    assert cfg.training.iterations_single == [150]
+    assert cfg.training.iterations_merged == [350]

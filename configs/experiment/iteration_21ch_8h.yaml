@@ -1,0 +1,45 @@
+# @package _global_
+#
+# Eight-hour-class full progressive run.  This preset intentionally does not
+# start training; invoke `pixi run train-managed experiment=iteration_21ch_8h`
+# when the GPU is available.  It selects the released 21-channel architecture
+# and the separately materialized 800x608 anonymous RGB data.
+#
+# 21 channels x (150 single + 350 merged) = 10,500 optimizer updates.  The
+# estimate assumes 2.5--3.0 seconds/update for the 12-block, decoder_ps=8
+# architecture at batch 12 on the exclusive RTX 5090: roughly 7.3--8.8 hours,
+# plus bounded validation.  Actual wall time is hardware/data-loader dependent.
+defaults:
+  - override /model: progressive_21ch
+  - override /data: anonymous_rgb_800x608
+  - override /augmentation: rgb_800x608
+  - _self_
+
+experiment:
+  name: iteration_21ch_8h
+  expected_wall_time_hours: 8
+
+optimization:
+  optimizer: amuse
+  ema_decay: 0.99
+
+training:
+  iterations_single: [150]
+  iterations_merged: [350]
+  # Bounded validation keeps the long progressive run within its time budget.
+  # Run tools/evaluate_local_checkpoint.py without --samples after completion
+  # to report the full validation/test metrics.
+  validation_samples: 128
+
+validation:
+  every_iterations: 100
+
+early_stopping:
+  enabled: true
+  patience: 3
+  min_delta: 0.01
+  min_epochs: 2
+  samples: 64
+
+checkpoint:
+  keep_best_k: 5
