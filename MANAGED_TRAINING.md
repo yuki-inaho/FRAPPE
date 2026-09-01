@@ -97,7 +97,7 @@ First prepare the data once (the source is already anonymous RGB PNG data):
 ```bash
 pixi run resize-data \
   --source /home/kasm-user/Desktop/data/frappe_rgb \
-  --output /home/kasm-user/Desktop/data/frappe_rgb_800x608 \
+  --output /workspace/data/frappe_rgb_800x608 \
   --width 800 --height 608
 ```
 
@@ -117,7 +117,7 @@ run, evaluate the complete validation and test splits with:
 ```bash
 pixi run python tools/evaluate_local_checkpoint.py \
   --checkpoint runs/progressive_21ch_800x608_001/checkpoints/last.pth.tar \
-  --dataset-root /home/kasm-user/Desktop/data/frappe_rgb_800x608/imagefolder
+  --dataset-root /workspace/data/frappe_rgb_800x608/imagefolder
 ```
 
 ## AMUSE and EMA
