@@ -918,3 +918,40 @@ float32 の値が丸め境界のどちら側にも落ちうるからで、これ
 
 `README.md` から `MANAGED_TRAINING.md` / `JOINT_PREFIX_TRAINING.md` への
 ポインタ段落を削除（利用者の指示）。`docs/` 以下には言及しない方針。
+
+### 独立監査の結果 (2026-09-02T08:50+09:00)
+
+平面配置と ONNX 入出力型について並列精読・敵対検証をかけた。実装は追認された:
+
+- 4 経路（`entropy_coding.arrange_latents` / `evaluate.py` / `tools/evaluate_joint_prefix.py` /
+  notebook `compute_bpp`）はすべて同一の要素写像 **`(c,h,w) → row = c*H + h, col = w`**
+  （channel-major, row-minor, C-contiguous）。実測で `torch.equal` かつ per-scale の
+  JPEG-LS ストリームが byte-identical。
+- 論文の `(n_s·T1/p_s, T2/p_s)` は **T1=高さ, T2=幅** で、`C = n_s`, `H = T1/p_s`,
+  `W = T2/p_s` を代入すればコードの `(C*H, W)` に一致する。608x800 で
+  608/32=19 行, 800/32=25 列と算術が閉じることを確認。
+- `to_pil_image` は mode `'L'`, size `(W, C*H)` を作り、JPEG-LS の SPIFF ヘッダに
+  行数・列数が入る（先頭ストリームが `...00000039 00000019` = 57 行 25 列）。
+  byte 一致には dtype・値・2D 形状・C 連続性の 4 つだけが要る、という分析も実装と一致。
+- `torch.flatten` を使い明示的な reshape 目標を避けたのは正しい、との評価も一致。
+
+**新たに定量化された不整合（既知の限界として記録）**:
+
+`entropy_coding.encode_latents` は scale 群ごとに 4 バイトの BE 長さ接頭辞を付けるが、
+`evaluate.py` / `tools/evaluate_joint_prefix.py` / notebook は生ペイロードのみを合計する。
+差は `32·G/(T1·T2)`、5 群 800x608 で **3.29e-4 bpp**:
+
+| run / split | 本記録の bpp | 接頭辞込み | CR |
+| --- | ---: | ---: | --- |
+| cr50 validation | 0.47499 | 0.47532 | 50.527 → 50.492 |
+| cr40 validation | 0.59308 | 0.59341 | 40.467 → 40.444 |
+| cr40 test | 0.61049 | 0.61082 | 39.313 → 39.292 |
+
+**レートの 0.07% 未満、CR にして 0.035 ポイント**であり、いずれの結論も動かない。
+ただし `evaluate_rate_distortion` 系（接頭辞込み）と `evaluate_joint_prefix` 系
+（接頭辞なし）の数値は厳密には直接比較できない。**本記録の横並びは全て後者で統一**
+してあるので内部整合はとれている。
+
+リファクタリングでは、この規約を**一箇所のビットストリーム module に集約し、
+接頭辞を数えるかどうかを明示的な引数にする**こと。現在 4 つのツールが
+`jpegls_bytes` をそれぞれ持っている重複が、この不整合を生みやすくしている。
