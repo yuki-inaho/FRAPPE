@@ -67,6 +67,7 @@ def build_argv(cfg: DictConfig) -> list[str]:
         "--early_stopping_min_delta": cfg.early_stopping.min_delta,
         "--early_stopping_min_epochs": cfg.early_stopping.min_epochs,
         "--early_stopping_samples": cfg.early_stopping.samples,
+        "--early_stopping_min_score": cfg.early_stopping.min_score,
         "--iterations_single": cfg.training.iterations_single,
         "--iterations_merged": cfg.training.iterations_merged,
         "--validation_every_iterations": cfg.validation.every_iterations,

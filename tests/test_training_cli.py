@@ -21,6 +21,7 @@ def test_managed_options_parse() -> None:
         "--validation_height", "480", "--validation_width", "640",
         "--iterations_single", "10", "--iterations_merged", "20",
         "--validation_every_iterations", "5",
+        "--early_stopping_min_score", "40.0",
     ])
     assert args.tensorboard is True
     assert args.keep_best_k == 3
@@ -33,6 +34,7 @@ def test_managed_options_parse() -> None:
     assert args.iterations_single == [10]
     assert args.iterations_merged == [20]
     assert args.validation_every_iterations == 5
+    assert args.early_stopping_min_score == 40.0
 
 
 def test_ps_is_still_required() -> None:

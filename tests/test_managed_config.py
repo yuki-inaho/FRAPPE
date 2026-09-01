@@ -90,4 +90,5 @@ def test_21ch_five_hour_noema_preset_is_full_scale_and_multicore() -> None:
     assert cfg.training.num_workers == 8
     assert cfg.training.iterations_single == [750]
     assert cfg.training.iterations_merged == [1700]
-    assert cfg.early_stopping.enabled is False
+    assert cfg.early_stopping.enabled is True
+    assert cfg.early_stopping.min_score == 40.0

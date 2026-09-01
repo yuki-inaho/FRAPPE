@@ -383,6 +383,8 @@ def parse_args(argv=None):
     p.add_argument('--early_stopping_min_delta', type=float, default=0.01)
     p.add_argument('--early_stopping_min_epochs', type=int, default=2)
     p.add_argument('--early_stopping_samples', type=int, default=128)
+    p.add_argument('--early_stopping_min_score', type=float, default=None,
+                   help='do not activate early stopping until validation PSNR reaches this value')
     return p.parse_args(argv)
 
 
@@ -405,6 +407,9 @@ def main(argv=None):
         raise ValueError('amuse_muon_min_ndim must be at least 2')
     if args.early_stopping and args.early_stopping_samples < 1:
         raise ValueError('early_stopping_samples must be positive when enabled')
+    if (args.early_stopping_min_score is not None
+            and not np.isfinite(args.early_stopping_min_score)):
+        raise ValueError('early_stopping_min_score must be finite when specified')
     if (args.iterations_single is None) != (args.iterations_merged is None):
         raise ValueError('iterations_single and iterations_merged must be supplied together')
     if args.iterations_merged is not None:
@@ -516,6 +521,7 @@ def main(argv=None):
     if args.early_stopping:
         print(f"  early_stopping=PSNR patience={args.early_stopping_patience} "
               f"min_delta={args.early_stopping_min_delta} "
+              f"min_score={args.early_stopping_min_score} "
               f"monitor_samples={early_stopping_dataset.num_rows}")
     print(f"  lam={config.lam}")
     print(f"  sc_max_lr={config.sc_max_lr}")
@@ -748,6 +754,7 @@ def main(argv=None):
                 patience=args.early_stopping_patience,
                 min_delta=args.early_stopping_min_delta,
                 min_epochs=args.early_stopping_min_epochs,
+                min_score=args.early_stopping_min_score,
             )
 
             def epoch_evaluator(monitor_step, _model, _channel=i_channel, _n_ch=n_ch,
@@ -759,6 +766,9 @@ def main(argv=None):
                 tracker.scalar(f'early_stopping/ch{_channel}/compression_ratio', epoch_cr, tracker_step)
                 print(f"  merge{_n_ch}ch {unit} {tracker_step} "
                       f"monitor_psnr={epoch_psnr:.3f} monitor_cr={epoch_cr:.2f}", flush=True)
+                if not early_stopper.threshold_reached:
+                    print(f"    early stopping inactive until PSNR >= "
+                          f"{early_stopper.min_score:.3f} dB", flush=True)
                 return epoch_psnr
         merge_losses = train_one(
             new_merged, decoder_params, dataloader, device, config,

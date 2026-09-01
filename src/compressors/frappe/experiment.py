@@ -162,18 +162,29 @@ class ModelEMA:
 
 
 class EarlyStopping:
-    """Maximize a validation metric and restore the best epoch's weights."""
+    """Maximize a validation metric and restore the best eligible weights.
 
-    def __init__(self, patience: int, min_delta: float = 0.0, min_epochs: int = 1) -> None:
+    ``min_score`` gates the mechanism: before a finite score reaches the
+    threshold, it neither saves a candidate nor accumulates patience.  This is
+    useful for long runs where a low-quality early plateau must never be
+    mistaken for convergence.
+    """
+
+    def __init__(self, patience: int, min_delta: float = 0.0, min_epochs: int = 1,
+                 min_score: float | None = None) -> None:
         if patience < 1:
             raise ValueError("early-stopping patience must be at least one")
         if min_delta < 0.0:
             raise ValueError("early-stopping min_delta must be non-negative")
         if min_epochs < 1:
             raise ValueError("early-stopping min_epochs must be at least one")
+        if min_score is not None and not math.isfinite(float(min_score)):
+            raise ValueError("early-stopping min_score must be finite when specified")
         self.patience = patience
         self.min_delta = float(min_delta)
         self.min_epochs = min_epochs
+        self.min_score = None if min_score is None else float(min_score)
+        self.threshold_reached = min_score is None
         self.best_score = float("-inf")
         self.best_epoch: int | None = None
         self.bad_epochs = 0
@@ -186,6 +197,12 @@ class EarlyStopping:
 
     def step(self, score: float, epoch: int, model: torch.nn.Module,
              ema: ModelEMA | None = None) -> bool:
+        if self.min_score is not None and (
+                not math.isfinite(float(score)) or float(score) < self.min_score):
+            # Do not consider a sub-threshold model a "best" checkpoint and
+            # do not let it consume early-stopping patience.
+            return False
+        self.threshold_reached = True
         if not math.isfinite(float(score)):
             self.bad_epochs += 1
             return epoch + 1 >= self.min_epochs and self.bad_epochs >= self.patience

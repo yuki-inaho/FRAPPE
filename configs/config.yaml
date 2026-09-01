@@ -75,6 +75,9 @@ early_stopping:
   min_delta: 0.01
   min_epochs: 2
   samples: 128
+  # Set a PSNR floor before this mechanism can choose/restore a checkpoint.
+  # Null preserves ordinary patience-based early stopping.
+  min_score: null
 
 logging:
   tensorboard: true

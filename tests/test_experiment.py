@@ -68,3 +68,26 @@ def test_early_stopping_restores_the_best_model_and_ema() -> None:
     assert stopper.best_epoch == 0
     assert model.weight.item() == 1.0
     assert ema.shadow["weight"].item() == 1.0
+
+
+def test_early_stopping_threshold_does_not_restore_subthreshold_weights() -> None:
+    model = torch.nn.Linear(1, 1, bias=False)
+    with torch.no_grad():
+        model.weight.fill_(1.0)
+    stopper = EarlyStopping(patience=1, min_delta=0.0, min_epochs=1, min_score=40.0)
+
+    assert not stopper.step(39.9, 0, model)
+    assert stopper.best_epoch is None
+    assert not stopper.restore(model)
+
+    with torch.no_grad():
+        model.weight.fill_(2.0)
+    assert not stopper.step(40.0, 1, model)
+    assert stopper.threshold_reached
+    assert stopper.best_epoch == 1
+
+    with torch.no_grad():
+        model.weight.fill_(3.0)
+    assert not stopper.step(39.9, 2, model)
+    assert stopper.restore(model)
+    assert model.weight.item() == 2.0

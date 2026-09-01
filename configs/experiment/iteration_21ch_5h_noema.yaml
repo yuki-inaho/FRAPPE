@@ -2,8 +2,9 @@
 #
 # Five-hour-class progressive training on the 800x608 anonymous RGB dataset.
 # This uses the released 21-channel, five-scale architecture with its 12-block
-# LayerScale decoder.  EMA and early stopping are disabled so short-history
-# averaged/random-initialized weights cannot replace the trained weights.
+# LayerScale decoder.  EMA is disabled so short-history averaged/random-
+# initialized weights cannot replace trained weights.  Early stopping is
+# allowed only after its monitor reaches 40 dB.
 #
 # RTX 5090 preflight at 800x608 (AMUSE, no EMA): batch 8 reserves 27.35 GiB;
 # batch 10 OOMs.  The full 21-channel merged step measured 0.317 s of GPU time.
@@ -33,12 +34,16 @@ training:
   num_workers: 8
   validation_samples: 128
 
-# Required by the fixed-iteration CLI but unused while early stopping is off.
 validation:
   every_iterations: 425
 
 early_stopping:
-  enabled: false
+  enabled: true
+  patience: 3
+  min_delta: 0.01
+  min_epochs: 2
+  samples: 128
+  min_score: 40.0
 
 checkpoint:
   keep_best_k: 3

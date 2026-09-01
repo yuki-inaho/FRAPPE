@@ -123,9 +123,10 @@ pixi run python tools/evaluate_local_checkpoint.py \
 ### Five-hour 21-channel run without EMA
 
 The calibrated no-EMA run uses the same released 21-channel/five-scale model,
-12-block LayerScale decoder and 800×608 data.  It disables early stopping,
-uses batch 8 (batch 10 OOMed in the 800×608 preflight), and loads shuffled
-batches with eight worker processes:
+12-block LayerScale decoder and 800×608 data.  It enables early stopping only
+after the 128-image monitor reaches 40 dB; below that floor it neither stops
+nor restores a low-quality checkpoint.  It uses batch 8 (batch 10 OOMed in
+the 800×608 preflight), and loads shuffled batches with eight worker processes:
 
 ```bash
 pixi run train-managed \
