@@ -51,6 +51,10 @@ ignore = [
 ]
 
 [tool.ruff.lint.per-file-ignores]
+# Standalone tools put the repository root on sys.path before importing from it,
+# so their library imports cannot come first. The alternative is a package
+# install step for scripts that are meant to be runnable from a checkout.
+"tools/*.py" = ["E402"]
 # The vendored optimiser is kept byte-close to its upstream so it can be
 # refreshed by re-copying; reformatting it would defeat that.
 "src/compressors/frappe/third_party/*" = ["ALL"]

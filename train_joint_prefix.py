@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import argparse
 import io
+import itertools
 import math
 import random
 import time
@@ -126,7 +127,8 @@ def evaluate(model: JointPrefixFRAPPE, images: torch.Tensor, prefixes: list[int]
         bpp = results[n]["bytes"] * 8 / (rate_images * pixels) if rate_images else float("nan")
         report[n] = {"psnr_db": -10.0 * math.log10(max(matched, 1e-12)), "bpp": bpp,
                      "compression_ratio": 24.0 / bpp if bpp > 0 else float("nan"),
-                     "psnr_all_images_db": -10.0 * math.log10(max(results[n]["mse"] / count, 1e-12)),
+                     "psnr_all_images_db": -10.0 * math.log10(
+                         max(results[n]["mse"] / count, 1e-12)),
                      "rate_images": rate_images, "images": count}
     model.train()
     return report
@@ -302,7 +304,7 @@ def prefix_loss(model: JointPrefixFRAPPE, x: torch.Tensor, points, mode: str,
         # A longer prefix that reconstructs worse breaks the property the
         # architecture exists for, so it is penalised rather than merely counted.
         violations = [torch.relu(later - earlier + args.mono_margin)
-                      for earlier, later in zip(distortions[:-1], distortions[1:])]
+                      for earlier, later in itertools.pairwise(distortions)]
         loss = loss + args.lam_mono * sum(violations) / len(violations)
     if args.lam_sat > 0:
         loss = loss + args.lam_sat * model.saturation_penalty()
@@ -444,7 +446,7 @@ def resume_if_asked(model, optimizer, ema, tracker, args, device: str
     return start_iteration, lam_rate
 
 
-def write_run_metadata(model, args, run_dir, device: str) -> None:
+def write_run_metadata(model, args, run_dir) -> None:
     """Everything needed to reproduce this run, written before it starts."""
     atomic_json_dump({
         "schema_version": 1,
@@ -454,7 +456,8 @@ def write_run_metadata(model, args, run_dir, device: str) -> None:
                   "channels": model.n_channels,
                   "parameters": sum(p.numel() for p in model.parameters())},
         "runtime": {"torch": torch.__version__, "cuda": torch.version.cuda,
-                    "device": torch.cuda.get_device_name(0) if torch.cuda.is_available() else "cpu"},
+                    "device": (torch.cuda.get_device_name(0)
+                               if torch.cuda.is_available() else "cpu")},
     }, run_dir / "run_metadata.json")
 
 
@@ -592,7 +595,7 @@ def main(argv=None) -> None:
 
     start_iteration, lam_rate = resume_if_asked(
         model, optimizer, ema, tracker, args, device)
-    write_run_metadata(model, args, run_dir, device)
+    write_run_metadata(model, args, run_dir)
     report_prefixes = sorted({n for n in (1, 9, 15, 18, model.n_channels)
                               if n <= model.n_channels})
     announce(model, args)

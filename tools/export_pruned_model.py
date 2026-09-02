@@ -27,10 +27,10 @@ REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
 if str(REPOSITORY_ROOT) not in sys.path:
     sys.path.insert(0, str(REPOSITORY_ROOT))
 
-from src.compressors.frappe.experiment import atomic_json_dump, atomic_torch_save  # noqa: E402
-from src.compressors.frappe.harness.checkpoints import load_checkpoint  # noqa: E402
-from src.compressors.frappe.harness.data import default_dataset_root  # noqa: E402
-from src.compressors.frappe.harness.pruning import (  # noqa: E402
+from src.compressors.frappe.experiment import atomic_json_dump, atomic_torch_save
+from src.compressors.frappe.harness.checkpoints import load_checkpoint
+from src.compressors.frappe.harness.data import default_dataset_root
+from src.compressors.frappe.harness.pruning import (
     PROXY_CRITERIA,
     RateMeter,
     channel_rates,
@@ -39,10 +39,10 @@ from src.compressors.frappe.harness.pruning import (  # noqa: E402
     measure,
     proxy_scores,
 )
-from src.compressors.frappe.prefix import prune_channels  # noqa: E402
+from src.compressors.frappe.prefix import prune_channels
 
 
-def select_channels(model, images, codes_cache, meter, args, device: str
+def select_channels(model, images, codes_cache, meter, args
                     ) -> tuple[list[int], str, list | None]:
     """Decide what to keep, and say by what authority."""
     frontier = None
@@ -56,7 +56,7 @@ def select_channels(model, images, codes_cache, meter, args, device: str
         kept, selection = point["channels"], "oracle"
     else:
         rates = channel_rates(model, images, codes_cache, meter)
-        scores = proxy_scores(model, images, codes_cache, device)[args.criterion]
+        scores = proxy_scores(model, images, codes_cache)[args.criterion]
         order = sorted(range(model.n_channels), key=lambda i: -(scores[i] / rates[i]))
         kept = sorted(index + 1 for index in order[:args.target_channels])
         selection = args.criterion
@@ -138,7 +138,7 @@ def main() -> None:
           f"{model.n_channels} channels", flush=True)
 
     kept, selection, frontier = select_channels(
-        model, images, codes_cache, meter, args, device)
+        model, images, codes_cache, meter, args)
     print(f"\n  keeping {len(kept)} channels by {selection}: {kept}", flush=True)
 
     before_psnr, before_bpp = measure(model, images, codes_cache, meter, kept)

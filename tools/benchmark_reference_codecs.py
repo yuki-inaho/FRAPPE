@@ -29,12 +29,12 @@ REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
 if str(REPOSITORY_ROOT) not in sys.path:
     sys.path.insert(0, str(REPOSITORY_ROOT))
 
-from src.compressors.frappe.harness import AnonymousImageFolder  # noqa: E402
-from src.compressors.frappe.harness.cli import (  # noqa: E402
+from src.compressors.frappe.harness import AnonymousImageFolder
+from src.compressors.frappe.harness.cli import (
     add_dataset_arguments,
     add_output_argument,
 )
-from src.compressors.frappe.harness.codecs import (  # noqa: E402
+from src.compressors.frappe.harness.codecs import (
     DEFAULT_LADDERS,
     available_codecs,
     interpolate,

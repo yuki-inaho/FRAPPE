@@ -11,8 +11,7 @@ from __future__ import annotations
 
 import pytest
 
-from src.compressors.frappe.harness.training import (
-    PrefixSampler, RateTarget, continuation_stage)
+from src.compressors.frappe.harness.training import PrefixSampler, RateTarget, continuation_stage
 
 BOUNDARIES = [0.10, 0.30, 0.55, 0.90]
 ALPHA_RANGE = (2.0, 64.0)

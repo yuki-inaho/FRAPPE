@@ -14,6 +14,7 @@ bitrate from another is a point on no curve.
 
 from __future__ import annotations
 
+import itertools
 from collections.abc import Callable, Sequence
 
 import torch
@@ -83,4 +84,4 @@ def monotonicity_violations(points: Sequence[RatePoint]) -> int:
     monotone is a defect rather than a curiosity, and it is cheap to count.
     """
     values = [point.psnr_db for point in points]
-    return sum(1 for earlier, later in zip(values[:-1], values[1:]) if later < earlier)
+    return sum(1 for earlier, later in itertools.pairwise(values) if later < earlier)

@@ -80,8 +80,8 @@ it by rank correlation and, more usefully, by the PSNR gap at matched bitrate.
 
 from __future__ import annotations
 
-import math
 import io
+import math
 from pathlib import Path
 
 import numpy as np
@@ -138,7 +138,7 @@ class RateMeter:
                      channels) -> int:
         kept = {int(c) for c in channels}
         total = 0
-        for group_index, (ps, start, end) in enumerate(self.model.scale_groups):
+        for group_index, (_ps, start, end) in enumerate(self.model.scale_groups):
             local = tuple(sorted(c - start for c in range(start, end) if c + 1 in kept))
             if local:
                 total += self.group_bytes(image_index, group_index,
@@ -162,13 +162,13 @@ def measure(model, images, codes_cache, meter, channels) -> tuple[float, float]:
             total_bytes * 8 / (len(images) * pixels))
 
 
-def proxy_scores(model, images, codes_cache, device) -> dict[str, np.ndarray]:
+def proxy_scores(model, images, codes_cache) -> dict[str, np.ndarray]:
     """Per-group importance under every cheap criterion, before rate normalisation."""
     n = model.n_channels
     scores = {name: np.zeros(n) for name in PROXY_CRITERIA}
 
     channel_of_group = []
-    for group_index, (ps, start, end) in enumerate(model.scale_groups):
+    for group_index, (_ps, start, end) in enumerate(model.scale_groups):
         for local in range(end - start):
             channel_of_group.append((group_index, local))
 

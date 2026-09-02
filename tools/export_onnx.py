@@ -59,17 +59,16 @@ REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
 if str(REPOSITORY_ROOT) not in sys.path:
     sys.path.insert(0, str(REPOSITORY_ROOT))
 
-from src.compressors.frappe.harness import AnonymousImageFolder  # noqa: E402
-from src.compressors.frappe.harness.bitstream import (  # noqa: E402
+from src.compressors.frappe.harness import AnonymousImageFolder
+from src.compressors.frappe.harness.bitstream import (
     CODE_OFFSET,
     BitstreamConvention,
     arrange_planes,
     encode_plane,
     encode_planes,
 )
-from src.compressors.frappe.harness.checkpoints import load_checkpoint  # noqa: E402
-from src.compressors.frappe.harness.data import default_dataset_root  # noqa: E402
-
+from src.compressors.frappe.harness.checkpoints import load_checkpoint
+from src.compressors.frappe.harness.data import default_dataset_root
 
 
 class EncoderGraph(torch.nn.Module):
@@ -367,8 +366,7 @@ def main() -> None:
     decoder_info = export(decoder, sample_planes, decoder_path, plane_names,
                           ["reconstruction"], (plane_shapes,), args.opset, args.simplify)
 
-    for label, path, info in (("encoder", encoder_path, encoder_info),
-                              ("decoder", decoder_path, decoder_info)):
+    for path, info in ((encoder_path, encoder_info), (decoder_path, decoder_info)):
         note = (f"  simplified {info['nodes_before']} -> {info['nodes_after']} nodes, "
                 f"{info['bytes_before'] / 1e6:.2f} -> {info['bytes'] / 1e6:.2f} MB"
                 if info.get("simplified") else "  not simplified")

@@ -38,7 +38,7 @@ def load_curves(results_root: Path, task: str = "rate_distortion") -> dict[str, 
         codec = payload.get("codec", path.parent.name)
         entries = []
         results = payload.get("results", {})
-        for key in sorted(results, key=lambda value: float(value)):
+        for key in sorted(results, key=float):
             per_image = results[key].get("per_image", [])
             if not per_image:
                 continue

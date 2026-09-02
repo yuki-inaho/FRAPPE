@@ -39,7 +39,8 @@ def _source_images(source_root: Path, dataset_index: int) -> list[Path]:
         raise ValueError(f"dataset_{dataset_index:03d} has no anonymous RGB PNG files")
     expected = [f"image_{index:08d}.png" for index in range(1, len(images) + 1)]
     if [path.name for path in images] != expected:
-        raise ValueError(f"dataset_{dataset_index:03d} does not use sequential anonymous image names")
+        raise ValueError(f"dataset_{dataset_index:03d} does not use sequential "
+                         "anonymous image names")
     return images
 
 
@@ -51,7 +52,7 @@ def _write_resized(source: Path, destination: Path, width: int, height: int) -> 
         clean = Image.frombytes("RGB", resized.size, resized.tobytes())
     temporary = destination.with_name(f".{destination.name}.tmp")
     clean.save(temporary, format="PNG", compress_level=1)
-    os.replace(temporary, destination)
+    temporary.replace(destination)
 
 
 def _link_view(source_files: list[Path], destination: Path) -> int:
@@ -62,7 +63,7 @@ def _link_view(source_files: list[Path], destination: Path) -> int:
         expected.add(name)
         target = destination / name
         if target.exists():
-            if os.path.samefile(source, target):
+            if source.samefile(target):
                 continue
             target.unlink()
         os.link(source, target)
@@ -72,8 +73,9 @@ def _link_view(source_files: list[Path], destination: Path) -> int:
     return len(expected)
 
 
-def resize_dataset(source_root: Path, output_root: Path, width: int, height: int,
-                   split_map: dict[str, list[int]]) -> dict[str, object]:
+def _validate_request(source_root: Path, output_root: Path, width: int, height: int,
+                      split_map: dict[str, list[int]]) -> None:
+    """Refuse anything that would destroy the anonymous source or mislabel a split."""
     if source_root.resolve() == output_root.resolve():
         raise ValueError("output must be a new directory; source anonymous data is preserved")
     if width < 1 or height < 1:
@@ -82,24 +84,41 @@ def resize_dataset(source_root: Path, output_root: Path, width: int, height: int
     if sorted(expected_indices) != [1, 2, 3, 4]:
         raise ValueError("dataset indices 1 through 4 must each be assigned to exactly one split")
 
+
+def _materialise(source_root: Path, output_root: Path, dataset_index: int,
+                 width: int, height: int) -> tuple[list[Path], list[Path]]:
+    """Write one dataset's resized copies, skipping those already correct.
+
+    Re-running is cheap and safe: an output that is already an RGB PNG of the
+    right size with no metadata is left alone, so an interrupted run resumes
+    rather than starting over.
+    """
+    inputs = _source_images(source_root, dataset_index)
+    destination = output_root / "canonical" / f"dataset_{dataset_index:03d}"
+    destination.mkdir(parents=True, exist_ok=True)
+    for index, source in enumerate(inputs, start=1):
+        target = destination / f"image_{index:08d}.png"
+        if not _valid_rgb_png(target, width, height):
+            _write_resized(source, target, width, height)
+        if index % 250 == 0 or index == len(inputs):
+            print(f"dataset_{dataset_index:03d}: {index}/{len(inputs)} RGB images",
+                  flush=True)
+    return inputs, sorted(destination.glob("image_????????.png"))
+
+
+def resize_dataset(source_root: Path, output_root: Path, width: int, height: int,
+                   split_map: dict[str, list[int]]) -> dict[str, object]:
+    _validate_request(source_root, output_root, width, height, split_map)
+
     canonical: dict[int, list[Path]] = {}
     summaries: list[dict[str, object]] = []
     for dataset_index in range(1, 5):
-        inputs = _source_images(source_root, dataset_index)
-        destination = output_root / "canonical" / f"dataset_{dataset_index:03d}"
-        destination.mkdir(parents=True, exist_ok=True)
-        for index, source in enumerate(inputs, start=1):
-            target = destination / f"image_{index:08d}.png"
-            if not _valid_rgb_png(target, width, height):
-                _write_resized(source, target, width, height)
-            if index % 250 == 0 or index == len(inputs):
-                print(f"dataset_{dataset_index:03d}: {index}/{len(inputs)} RGB images", flush=True)
-        canonical[dataset_index] = sorted(destination.glob("image_????????.png"))
-        summaries.append({
-            "dataset_id": f"dataset_{dataset_index:03d}",
-            "image_count": len(inputs),
-            "dimensions": {f"{width}x{height}": len(inputs)},
-        })
+        inputs, resized = _materialise(source_root, output_root,
+                                       dataset_index, width, height)
+        canonical[dataset_index] = resized
+        summaries.append({"dataset_id": f"dataset_{dataset_index:03d}",
+                          "image_count": len(inputs),
+                          "dimensions": {f"{width}x{height}": len(inputs)}})
 
     split_counts = {
         split: _link_view(
@@ -110,7 +129,8 @@ def resize_dataset(source_root: Path, output_root: Path, width: int, height: int
     }
     for split, expected_count in split_counts.items():
         images = sorted((output_root / "imagefolder" / split).glob("image_????????.png"))
-        if len(images) != expected_count or not all(_valid_rgb_png(path, width, height) for path in images):
+        if len(images) != expected_count or not all(
+                _valid_rgb_png(path, width, height) for path in images):
             raise RuntimeError(f"invalid {split} output")
 
     report = {

@@ -37,10 +37,10 @@ REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
 if str(REPOSITORY_ROOT) not in sys.path:
     sys.path.insert(0, str(REPOSITORY_ROOT))
 
-from src.compressors.frappe.harness import AnonymousImageFolder  # noqa: E402
-from src.compressors.frappe.harness.checkpoints import load_checkpoint  # noqa: E402
-from src.compressors.frappe.harness.data import default_dataset_root  # noqa: E402
-from src.compressors.frappe.harness.reporting import Table  # noqa: E402
+from src.compressors.frappe.harness import AnonymousImageFolder
+from src.compressors.frappe.harness.checkpoints import load_checkpoint
+from src.compressors.frappe.harness.data import default_dataset_root
+from src.compressors.frappe.harness.reporting import Table
 
 
 def jpegls_group_bytes(plane: torch.Tensor) -> int:

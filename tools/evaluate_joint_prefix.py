@@ -18,21 +18,21 @@ REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
 if str(REPOSITORY_ROOT) not in sys.path:
     sys.path.insert(0, str(REPOSITORY_ROOT))
 
-from src.compressors.frappe.harness import AnonymousImageFolder  # noqa: E402
-from src.compressors.frappe.harness.bitstream import BitstreamConvention  # noqa: E402
-from src.compressors.frappe.harness.checkpoints import load_checkpoint  # noqa: E402
-from src.compressors.frappe.harness.cli import (  # noqa: E402
+from src.compressors.frappe.harness import AnonymousImageFolder
+from src.compressors.frappe.harness.bitstream import BitstreamConvention
+from src.compressors.frappe.harness.checkpoints import load_checkpoint
+from src.compressors.frappe.harness.cli import (
     add_dataset_arguments,
     add_device_argument,
     add_output_argument,
     resolve_device,
 )
-from src.compressors.frappe.harness.evaluation import (  # noqa: E402
+from src.compressors.frappe.harness.evaluation import (
     evaluate_operating_points,
     monotonicity_violations,
 )
-from src.compressors.frappe.harness.metrics import Averaging  # noqa: E402
-from src.compressors.frappe.harness.reporting import Table, write_report  # noqa: E402
+from src.compressors.frappe.harness.metrics import Averaging
+from src.compressors.frappe.harness.reporting import Table, write_report
 
 LADDER = Table([("n", "label", "3d"), ("PSNR dB", "psnr_db", "8.2f"),
                 ("bpp", "bpp", "9.4f"), ("CR", "compression_ratio", "9.2f")])

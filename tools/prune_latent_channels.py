@@ -20,14 +20,14 @@ REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
 if str(REPOSITORY_ROOT) not in sys.path:
     sys.path.insert(0, str(REPOSITORY_ROOT))
 
-from src.compressors.frappe.harness.checkpoints import load_checkpoint  # noqa: E402
-from src.compressors.frappe.harness.cli import (  # noqa: E402
+from src.compressors.frappe.harness.checkpoints import load_checkpoint
+from src.compressors.frappe.harness.cli import (
     add_dataset_arguments,
     add_device_argument,
     add_output_argument,
     resolve_device,
 )
-from src.compressors.frappe.harness.pruning import (  # noqa: E402
+from src.compressors.frappe.harness.pruning import (
     PROXY_CRITERIA,
     RateMeter,
     channel_rates,
@@ -61,7 +61,7 @@ def select_at_targets(model, images, codes_cache, meter, rates, scores, frontier
                              "compression_ratio": 24.0 / bpp}
             print(f"      {name:11s} keep {len(kept):2d}  {bpp:7.4f} bpp"
                   f"  CR {24.0 / bpp:7.2f}  {psnr:6.2f} dB   {kept}")
-        prefix = [c for c in range(1, model.n_channels + 1)]
+        prefix = list(range(1, model.n_channels + 1))
         best_prefix = None
         for n in range(1, model.n_channels + 1):
             psnr, bpp = measure(model, images, codes_cache, meter, prefix[:n])
@@ -80,7 +80,8 @@ def select_at_targets(model, images, codes_cache, meter, rates, scores, frontier
                 entries["oracle"] = {"channels": best["channels"], "psnr_db": best["psnr_db"],
                                      "bpp": best["bpp"],
                                      "compression_ratio": 24.0 / best["bpp"]}
-                print(f"      {'oracle':11s} keep {len(best['channels']):2d}  {best['bpp']:7.4f} bpp"
+                print(f"      {'oracle':11s} keep {len(best['channels']):2d}  "
+                      f"{best['bpp']:7.4f} bpp"
                       f"  CR {24.0 / best['bpp']:7.2f}  {best['psnr_db']:6.2f} dB   "
                       f"{best['channels']}")
         report["selections"][str(target)] = entries
@@ -113,7 +114,7 @@ def main() -> None:
     print(f"checkpoint iteration={state.get('iteration')}  {model.n_channels} latent channels, "
           f"{len(images)} images\n")
     rates = channel_rates(model, images, codes_cache, meter)
-    scores = proxy_scores(model, images, codes_cache, device)
+    scores = proxy_scores(model, images, codes_cache)
 
     print("  per-channel cost and importance (importance/bit in parentheses):")
     print(f"    {'ch':>3} {'ps':>3} {'bpp':>8}  " +

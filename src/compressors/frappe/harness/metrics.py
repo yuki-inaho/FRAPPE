@@ -12,10 +12,10 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass, field
-from enum import Enum
+from enum import StrEnum
 
 
-class Averaging(str, Enum):
+class Averaging(StrEnum):
     """How per-image distortion becomes one number."""
 
     #: Convert one aggregate MSE. The convention of the joint-prefix tools.

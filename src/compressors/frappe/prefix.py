@@ -486,7 +486,7 @@ def prune_channels(model: JointPrefixFRAPPE, kept, config) -> JointPrefixFRAPPE:
 
     # Which channels of which original scale group survive, in order.
     survivors: list[tuple[int, list[int]]] = []
-    for group_index, (ps, start, end) in enumerate(model.scale_groups):
+    for group_index, (_ps, start, end) in enumerate(model.scale_groups):
         local = [channel - 1 - start for channel in kept if start < channel <= end]
         if local:
             survivors.append((group_index, local))

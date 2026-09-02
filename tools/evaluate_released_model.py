@@ -30,10 +30,10 @@ REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
 if str(REPOSITORY_ROOT) not in sys.path:
     sys.path.insert(0, str(REPOSITORY_ROOT))
 
-from src.compressors.frappe.harness.bitstream import measure_rate  # noqa: E402
-from src.compressors.frappe.harness.data import default_dataset_root  # noqa: E402
-from src.compressors.frappe.model import load_from_hub, load_progressive_model  # noqa: E402
-from src.compressors.frappe.quantize import srgb_to_linear  # noqa: E402
+from src.compressors.frappe.harness.bitstream import measure_rate
+from src.compressors.frappe.harness.data import default_dataset_root
+from src.compressors.frappe.model import load_from_hub, load_progressive_model
+from src.compressors.frappe.quantize import srgb_to_linear
 
 
 @torch.no_grad()

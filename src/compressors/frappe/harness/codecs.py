@@ -74,22 +74,28 @@ def _encode_ffmpeg(image: Image.Image, encoder: str, setting: int,
             return payload, decoded.convert("RGB")
 
 
-def available_codecs(requested: list[str]) -> list[str]:
+def _probe_once(probe: Image.Image, codec: str) -> None:
+    """Encode one tiny image, so an unavailable codec fails here and not mid-sweep."""
     from PIL import features
+
+    if codec == "avif":
+        if shutil.which("ffmpeg") is None:
+            raise RuntimeError("ffmpeg is not installed")
+        _encode_ffmpeg(probe, "libaom-av1", 30, "avif")
+        return
+    if codec in {"jpeg", "webp"} and not features.check(
+            {"jpeg": "jpg", "webp": "webp"}[codec]):
+        raise RuntimeError(f"Pillow has no {codec} support")
+    _encode_pillow(probe, codec, DEFAULT_LADDERS[codec][0])
+
+
+def available_codecs(requested: list[str]) -> list[str]:
 
     probe = Image.new("RGB", (64, 64), (120, 90, 60))
     usable = []
     for codec in requested:
         try:
-            if codec == "avif":
-                if shutil.which("ffmpeg") is None:
-                    raise RuntimeError("ffmpeg is not installed")
-                _encode_ffmpeg(probe, "libaom-av1", 30, "avif")
-            else:
-                if codec in {"jpeg", "webp"} and not features.check(
-                        {"jpeg": "jpg", "webp": "webp"}[codec]):
-                    raise RuntimeError(f"Pillow has no {codec} support")
-                _encode_pillow(probe, codec, DEFAULT_LADDERS[codec][0])
+            _probe_once(probe, codec)
             usable.append(codec)
         except Exception as error:
             print(f"  skipping {codec}: {type(error).__name__}: {error}", flush=True)

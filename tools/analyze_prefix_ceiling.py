@@ -33,8 +33,8 @@ from __future__ import annotations
 
 import argparse
 import io
-import sys
 import json
+import sys
 import time
 from pathlib import Path
 
@@ -50,7 +50,7 @@ REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
 if str(REPOSITORY_ROOT) not in sys.path:
     sys.path.insert(0, str(REPOSITORY_ROOT))
 
-from src.compressors.frappe.harness.data import default_dataset_root  # noqa: E402
+from src.compressors.frappe.harness.data import default_dataset_root
 
 DEFAULT_PS = [32, 32, 32, 16, 16, 16, 16, 16, 16, 8, 8, 8,
               4, 4, 4, 4, 4, 4, 2, 2, 2]
@@ -199,7 +199,10 @@ def joint_linear_bound(fit: torch.Tensor, evaluate: torch.Tensor, groups,
     for step in range(steps):
         index = torch.randint(0, fit.shape[0], (min(batch, fit.shape[0]),), device=device)
         loss = F.mse_loss(reconstruct(fit[index]), fit[index])
-        optimizer.zero_grad(); loss.backward(); optimizer.step(); schedule.step()
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
+        schedule.step()
         if verbose and (step % max(steps // 8, 1) == 0 or step == steps - 1):
             with torch.no_grad():
                 value = psnr(evaluate, reconstruct(evaluate).clamp(-1, 1))
@@ -299,7 +302,7 @@ def main(argv: list[str] | None = None) -> None:
                     args.joint_fit_images if "joint-linear" in args.bounds else 0)
     fit = load_images(args.dataset_root, "train", fit_count, device)
     evaluate = load_images(args.dataset_root, args.split, args.images, device)
-    b, c, h, w = evaluate.shape
+    b, _c, h, w = evaluate.shape
     verbose = not args.quiet
     if verbose:
         print(f"fit={tuple(fit.shape)} eval={tuple(evaluate.shape)} groups={groups}", flush=True)
