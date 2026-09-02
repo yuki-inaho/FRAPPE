@@ -7,3 +7,6 @@ outputs/
 runs/
 .private/
 index.md
+# Compacted session transcripts. They carry the conversation verbatim, which
+# includes home paths and private dataset locations, so they stay out of git.
+temp/session_extracts/
