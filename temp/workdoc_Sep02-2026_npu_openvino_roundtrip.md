@@ -531,6 +531,9 @@ ffmpeg -hide_banner -i plane.jls -f rawvideo -pix_fmt gray - | cmp - plane.raw
 | 2026-09-02 | 10:54 JST | どちらも | **CharLS ベースで確定** | エントロピー符号器は CharLS (pillow-jpls) で確定。encoder は CPU (bit-exact)、decoder は最速構成の GPU。NPU (2.6× 遅い + ramp + 形状固定) と JPEG XL e1 (3.2× 遅く 41% 大きい) は不採用。根拠は本表の実測行 |
 | 2026-09-02 | 11:05 JST | どちらも | YAGNI/KISS による整理 (ユーザー判断) | JXL 依存 (`pillow-jxl-plugin`) と NPU JPEG-LS オフロード (`jpegls_openvino.py` + テスト 27 件 + ベンチ 2 本) をリポジトリから削除。判定根拠は本表 (10:30〜10:55 行) と git 履歴 (`5a24353`, `91e4ec6`, `3ce38a6`) に保存。削除後スイート再確認: 全緑 (159 passed + 2 skipped) |
 | 2026-09-02 | 11:08 JST | どちらも | 論文と同等の処理フローを削除後ツリーで再確認 | CR-50: 27.527 dB / 0.49488 bpp / CR 48.50、CR-40: 28.575 dB / 0.61546 bpp / CR 39.00 — NPU decode 構成の 62 枚評価と同一値 (デバイスは速度のみを変えることを再確認)。§8 に最終構成として記載 |
+| 2026-09-02 | 11:20 JST | どちらも | **encode 経路の実測** (ユーザー要求: encoder→CharLS→バイト列の時間と圧縮率) | 62 枚 steady median (warmup 除外): encoder fp32 1.67-2.04 ms + CharLS 1.86-1.93 ms、end-to-end **4.63 ms** (124 Mpx/s)。CR は raw 24bpp 基準 **50.27×**、ソース PNG 基準 32.50× |
+| 2026-09-02 | 11:25 JST | どちらも | **encoder int8 化 (PTQ) と効果測定** | NNCF は不可 (1.x は torch 2.11 と非互換な C++ 拡張、2.x/3.x は numpy ピン競合) → onnxruntime `quantize_static` (QDQ, QInt8×2, per-channel, Conv のみ, 32 枚キャリブレーション) で int8 化。再利用可能な 2 ツールとして整備: `tools/quantize_encoder_int8.py` + `tools/profile_encode_path.py` (インターリーブ計測でクロックドリフトを相殺、warmup は定義により除外) |
+| 2026-09-02 | 11:26 JST | どちらも | int8 効果 (62 枚, CR-50) | encoder 2.04→1.58 ms (**1.30×**)、end-to-end 4.63→**3.96 ms** (1.17×)、レート **−0.8%** (28,806 B)、PSNR **−0.045 dB** (27.683 dB)、平面ドリフト 147,781/20,880,050 (0.7%, 最大 ±1)。encoder はレイテンシ律速のため int8 効果は控えめ — CharLS 段 (1.93 ms) が次の律速 |
 
 ---
 
@@ -574,3 +577,14 @@ pixi run python tools/roundtrip_openvino.py \
   同一規約で比較可能。
 * 両動作点とも、decoder のデバイスを変えても PSNR/bpp は 1 ビットも変わらない
   (10:44 行と 11:08 行の値が完全一致)。デバイスは速度だけを変える。
+
+**encode 経路のオプション (2026-09-02 11:26 実測):**
+
+| 構成 | encoder | end-to-end | レート | PSNR |
+| :--- | :--- | :--- | :--- | :--- |
+| fp32 (bit-exact, 既定) | 2.04 ms | 4.63 ms | 29,030 B/img | 27.729 dB |
+| int8 (PTQ, `--int8-encoder`) | 1.58 ms | **3.96 ms** | 28,806 B/img (−0.8%) | 27.683 dB (−0.045 dB) |
+
+品質を bit-exact に保つなら fp32、速度優先なら int8 (`pixi run quantize-encoder-int8` で
+生成し `--int8-encoder` で渡す)。次の律速は CharLS 段 (1.93 ms) と分析路自体であり、
+int8 は encoder を 1.3× 速くするにとどまる。
