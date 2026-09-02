@@ -66,8 +66,7 @@ BitstreamConvention.WITH_LENGTH_PREFIX = BitstreamConvention(count_length_prefix
 
 
 @checked
-def arrange_plane(latent: Int8[Tensor, "channels grid_h grid_w"]
-                  ) -> UInt8[Tensor, "rows cols"]:
+def arrange_plane(latent: Int8[Tensor, "channels grid_h grid_w"]) -> UInt8[Tensor, "rows cols"]:
     """One scale group's latent as the grayscale image JPEG-LS receives.
 
     ``(C, H, W) -> (C*H, W)`` with the codes shifted into ``uint8``: channel
@@ -80,8 +79,9 @@ def arrange_plane(latent: Int8[Tensor, "channels grid_h grid_w"]
     return (flat.to(torch.int16) + CODE_OFFSET).to(torch.uint8)
 
 
-def arrange_planes(latents: Iterable[Shaped[Tensor, ...]],
-                   channels: Sequence[int] | None = None) -> list[Tensor]:
+def arrange_planes(
+    latents: Iterable[Shaped[Tensor, ...]], channels: Sequence[int] | None = None
+) -> list[Tensor]:
     """Arrange every scale group, optionally keeping only the first channels.
 
     ``latents`` may be ``(1, C, H, W)`` or ``(C, H, W)``; the batch axis is
@@ -102,8 +102,7 @@ def arrange_planes(latents: Iterable[Shaped[Tensor, ...]],
     return planes
 
 
-def prefix_channels(scale_groups: Sequence[tuple[int, int, int]],
-                    n_channels: int) -> list[int]:
+def prefix_channels(scale_groups: Sequence[tuple[int, int, int]], n_channels: int) -> list[int]:
     """How many channels of each scale group the prefix ``1:n_channels`` keeps."""
     kept, remaining = [], n_channels
     for _, start, end in scale_groups:
@@ -114,7 +113,17 @@ def prefix_channels(scale_groups: Sequence[tuple[int, int, int]],
 
 
 def encode_plane(plane: UInt8[Tensor, "rows cols"]) -> bytes:
-    """The bare JPEG-LS stream for one arranged plane."""
+    """The bare JPEG-LS stream for one arranged plane.
+
+    CharLS's C API is used when the library is loadable, because its foreign
+    calls release the GIL and the PIL path holds it -- byte-identical output,
+    but a caller with several planes can run them concurrently. The PIL path
+    stays as the fallback so the harness works without libcharls installed.
+    """
+    from . import charls_native
+
+    if charls_native.available():
+        return charls_native.encode_plane(plane.numpy())
     import pillow_jpls  # noqa: F401 -- registers the JPEG-LS plugin with PIL
     from PIL import Image
 
@@ -123,10 +132,19 @@ def encode_plane(plane: UInt8[Tensor, "rows cols"]) -> bytes:
     return buffer.getvalue()
 
 
-def encode_planes(planes: Sequence[Tensor],
-                  convention: BitstreamConvention = BitstreamConvention.PAYLOAD_ONLY,
-                  ) -> bytes:
-    """Serialise arranged planes, with or without the self-describing prefixes."""
+def encode_planes(
+    planes: Sequence[Tensor],
+    convention: BitstreamConvention = BitstreamConvention.PAYLOAD_ONLY,
+) -> bytes:
+    """Serialise arranged planes, with or without the self-describing prefixes.
+
+    The planes are encoded sequentially, on purpose: one plane holds 77% of
+    the samples at FRAPPE's operating points, JPEG-LS cannot be parallelised
+    within a plane (each sample's context is its already-coded neighbours),
+    and on the real planes a thread pool was measured making the path slower
+    (2.0-2.8 ms against 1.75 ms sequential) -- the scheduling overhead exceeds
+    the at most 0.3 ms that perfect overlap could hide.
+    """
     chunks = []
     for plane in planes:
         payload = encode_plane(plane)
@@ -160,19 +178,20 @@ def decode_planes(blob: bytes) -> list[UInt8[Tensor, "rows cols"]]:
         (length,) = struct.unpack_from(">I", blob, offset)
         offset += LENGTH_PREFIX_BYTES
         if offset + length > total:
-            raise ValueError(
-                f"truncated blob: a chunk of {length} bytes overruns the buffer")
-        with Image.open(io.BytesIO(blob[offset:offset + length])) as handle:
+            raise ValueError(f"truncated blob: a chunk of {length} bytes overruns the buffer")
+        with Image.open(io.BytesIO(blob[offset : offset + length])) as handle:
             handle.load()
             planes.append(torch.from_numpy(np.asarray(handle, dtype=np.uint8).copy()))
         offset += length
     return planes
 
 
-def measure_rate(latents: Iterable[Tensor], pixels: int,
-                 channels: Sequence[int] | None = None,
-                 convention: BitstreamConvention = BitstreamConvention.PAYLOAD_ONLY,
-                 ) -> tuple[int, float]:
+def measure_rate(
+    latents: Iterable[Tensor],
+    pixels: int,
+    channels: Sequence[int] | None = None,
+    convention: BitstreamConvention = BitstreamConvention.PAYLOAD_ONLY,
+) -> tuple[int, float]:
     """``(bytes, bits per pixel)`` for one image's latents.
 
     ``pixels`` is the image's ``height * width``, not its element count: the

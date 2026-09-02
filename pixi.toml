@@ -13,6 +13,7 @@ sympy = "*"
 einops = "*"
 matplotlib = "*"
 jupyterlab = "*"
+charls = ">=2.4.4,<3"
 
 [activation.env]
 # The repository root on the path, so `pixi run python ...` can import
