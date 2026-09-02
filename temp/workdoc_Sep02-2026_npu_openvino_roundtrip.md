@@ -534,6 +534,7 @@ ffmpeg -hide_banner -i plane.jls -f rawvideo -pix_fmt gray - | cmp - plane.raw
 | 2026-09-02 | 11:20 JST | どちらも | **encode 経路の実測** (ユーザー要求: encoder→CharLS→バイト列の時間と圧縮率) | 62 枚 steady median (warmup 除外): encoder fp32 1.67-2.04 ms + CharLS 1.86-1.93 ms、end-to-end **4.63 ms** (124 Mpx/s)。CR は raw 24bpp 基準 **50.27×**、ソース PNG 基準 32.50× |
 | 2026-09-02 | 11:25 JST | どちらも | **encoder int8 化 (PTQ) と効果測定** | NNCF は不可 (1.x は torch 2.11 と非互換な C++ 拡張、2.x/3.x は numpy ピン競合) → onnxruntime `quantize_static` (QDQ, QInt8×2, per-channel, Conv のみ, 32 枚キャリブレーション) で int8 化。再利用可能な 2 ツールとして整備: `tools/quantize_encoder_int8.py` + `tools/profile_encode_path.py` (インターリーブ計測でクロックドリフトを相殺、warmup は定義により除外) |
 | 2026-09-02 | 11:26 JST | どちらも | int8 効果 (62 枚, CR-50) | encoder 2.04→1.58 ms (**1.30×**)、end-to-end 4.63→**3.96 ms** (1.17×)、レート **−0.8%** (28,806 B)、PSNR **−0.045 dB** (27.683 dB)、平面ドリフト 147,781/20,880,050 (0.7%, 最大 ±1)。encoder はレイテンシ律速のため int8 効果は控えめ — CharLS 段 (1.93 ms) が次の律速 |
+| 2026-09-02 | 11:35 JST | どちらも | **CharLS の適用対象とコスト構造の確認** (ユーザーの疑問) | CharLS は encoder 出力の 5 枚の grayscale 等価平面 (C×H, W, 計 336,775 サンプル = 元画像の 23%) に適用。「元画像と処理時間が変わらない」は誤りで実測では**14.6× 速い**: 元 RGB 画像に直接 CharLS をかけると 27.09 ms (54 Msamp/s) のところ、平面では 1.86 ms (181 Msamp/s)。JPEG turbo が元画像を 2.30 ms で処理できるのは SIMD ベクトル化 (635 Msamp/s) のためで、JPEG-LS は各サンプルが既符号化近傍に依存する逐次スカラーアルゴリズムでベクトル化不可能 — サンプル数を 23% に減らしたことが速度の正体。なお 5 平面の ThreadPool 並列化は 0.90× と効果なし (PIL の encoder が GIL を解放しない) |
 
 ---
 
