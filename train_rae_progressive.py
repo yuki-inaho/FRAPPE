@@ -14,28 +14,39 @@ only the input channel count grows.
 """
 
 import os
+
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "garbage_collection_threshold:0.5"
 
-import argparse, atexit, io, json, random, time
-import torch, datasets, PIL.Image, pillow_jpls, numpy as np
-import bjontegaard as bd
+import argparse
+import atexit
+import io
+import json
+import random
+import time
 from types import SimpleNamespace
+
+import bjontegaard as bd
+import datasets
+import numpy as np
+import PIL.Image
+import pillow_jpls  # noqa: F401 -- registers the JPEG-LS plugin with PIL
+import torch
 from timm.optim import Adan
 from torchvision.transforms.v2.functional import pil_to_tensor, to_pil_image
 
-from src.compressors.frappe.model import AutoencoderSingleChannel, MergedAutoencoder
-from src.compressors.frappe.ops import get_scale_groups, decoder_channels_per_encoder
-from src.compressors.frappe.quantize import srgb_to_linear
 from src.compressors.frappe.augmentation import RGBTrainingAugmentation
 from src.compressors.frappe.experiment import (
-    KBestCheckpointManager,
     EarlyStopping,
+    KBestCheckpointManager,
     ModelEMA,
     TensorBoardTracker,
     atomic_json_dump,
     atomic_torch_save,
 )
+from src.compressors.frappe.model import AutoencoderSingleChannel, MergedAutoencoder
+from src.compressors.frappe.ops import decoder_channels_per_encoder, get_scale_groups
 from src.compressors.frappe.prefix import zero_expand_first_conv
+from src.compressors.frappe.quantize import srgb_to_linear
 from src.compressors.frappe.third_party.amuse import AMUSE
 
 
@@ -509,7 +520,7 @@ def main(argv=None):
     print(f"  Progressive patchify training on {device}")
     print(f"  Total channels: {n_channels}")
     print(f"  Decoder ps: {config.decoder_ps}")
-    print(f"  Scale groups:")
+    print("  Scale groups:")
     for s, (ps_s, start, end) in enumerate(all_groups):
         n_g = end - start
         dec_ch_g = n_g * decoder_channels_per_encoder(ps_s, config.decoder_ps)
@@ -881,7 +892,7 @@ def main(argv=None):
     atomic_json_dump(results, results_path)
 
     print(f"\n{'='*60}")
-    print(f"  FINISHED")
+    print("  FINISHED")
     if valid_psnr:
         print(f"  Final PSNR: {valid_psnr[-1]:.2f} dB  CR: {valid_cr[-1]:.2f}")
     print(f"  Total time: {total_time/3600:.2f} hours")

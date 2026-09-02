@@ -1,9 +1,8 @@
 def build():
-    from subprocess import run
-    from shutil import rmtree, copytree, copyfile, make_archive
     from os.path import exists
     from pathlib import Path
-    from re import sub
+    from shutil import copyfile, copytree, rmtree
+    from subprocess import run
 
     # Generate the bare landing page as a copy of overview.md so the
     # root and the first chapter render identical content.

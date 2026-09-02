@@ -61,9 +61,8 @@ def test_numeric_order_rgb_filter_and_metadata_removal(tmp_path: Path) -> None:
 def test_rejects_archive_path_traversal(tmp_path: Path) -> None:
     archive = tmp_path / "unsafe.zip"
     make_zip(archive, [("../Color/00000001.png", png_bytes((0, 0, 0)))])
-    with open_archive(archive) as reader:
-        with pytest.raises(ValueError, match="unsafe member"):
-            ordered_members(reader)
+    with open_archive(archive) as reader, pytest.raises(ValueError, match="unsafe member"):
+        ordered_members(reader)
 
 
 def test_rejects_tar_links(tmp_path: Path) -> None:
@@ -73,9 +72,8 @@ def test_rejects_tar_links(tmp_path: Path) -> None:
         link.type = tarfile.SYMTYPE
         link.linkname = "elsewhere"
         output.addfile(link)
-    with open_archive(archive) as reader:
-        with pytest.raises(ValueError, match="contains a link"):
-            ordered_members(reader)
+    with open_archive(archive) as reader, pytest.raises(ValueError, match="contains a link"):
+        ordered_members(reader)
 
 
 def test_anonymous_imagefolder_uses_hardlinks(tmp_path: Path) -> None:

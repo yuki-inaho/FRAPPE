@@ -165,3 +165,25 @@ def test_annotations_reject_the_wrong_dtype_and_rank():
         bitstream.arrange_plane(torch.zeros(3, 4, 5))  # float, not int8
     with pytest.raises(TypeCheckError):
         bitstream.arrange_plane(torch.zeros(4, 5, dtype=torch.int8))  # rank 2
+
+
+def test_every_jpegls_writer_imports_the_plugin():
+    """JPEG-LS reaches PIL only as an import side effect, which linters delete.
+
+    ``pillow_jpls`` registers the codec when imported and is never referenced
+    afterwards, so an unused-import fix removes it and the failure appears far
+    away, at the first save. Any module that writes the format has to keep the
+    import, and this is what says so.
+    """
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parents[1]
+    offenders = []
+    for path in sorted(root.glob("**/*.py")):
+        if ".pixi" in path.parts or path.name == Path(__file__).name:
+            continue
+        source = path.read_text(encoding="utf-8")
+        if 'format="JPEG-LS"' in source or "format='JPEG-LS'" in source:
+            if "pillow_jpls" not in source:
+                offenders.append(path.relative_to(root).as_posix())
+    assert not offenders, f"writes JPEG-LS without importing pillow_jpls: {offenders}"

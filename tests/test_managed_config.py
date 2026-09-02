@@ -1,7 +1,7 @@
 import json
+from pathlib import Path
 
 from hydra import compose, initialize_config_dir
-from pathlib import Path
 
 from train_managed import build_argv
 
