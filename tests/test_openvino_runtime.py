@@ -143,9 +143,8 @@ def test_scale_grouping_agrees_with_the_torch_side_definition(schedule):
     applies to the pixel_unshuffle rewrite of adapt_to_decoder.
     """
     pytest.importorskip("torch", reason="the ops.py definition pulls in torch")
-    from src.compressors.frappe.ops import get_scale_groups
-
     from src.compressors.frappe.openvino_runtime import scale_groups_of
+    from src.compressors.frappe.ops import get_scale_groups
 
     expected = [(ps, end - start) for ps, start, end in
                 get_scale_groups(schedule, len(schedule))]

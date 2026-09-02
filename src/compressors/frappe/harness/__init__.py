@@ -16,6 +16,7 @@ explicit argument makes that a choice rather than an accident.
 from .bitstream import (
     BitstreamConvention,
     arrange_planes,
+    decode_planes,
     encode_planes,
     measure_rate,
 )
@@ -28,6 +29,7 @@ __all__ = [
     "RateDistortionAccumulator",
     "RatePoint",
     "arrange_planes",
+    "decode_planes",
     "default_dataset_root",
     "encode_planes",
     "measure_rate",

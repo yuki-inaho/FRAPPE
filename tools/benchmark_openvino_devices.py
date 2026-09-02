@@ -62,10 +62,28 @@ REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
 if str(REPOSITORY_ROOT) not in sys.path:
     sys.path.insert(0, str(REPOSITORY_ROOT))
 
-from src.compressors.frappe.bitstream import encode_planes  # noqa: E402
-from src.compressors.frappe.openvino_runtime import (  # noqa: E402
-    FrappeDecoder, FrappeEncoder, available_devices)
-from tools.roundtrip_openvino import load_image, testbed  # noqa: E402
+from src.compressors.frappe.harness import (
+    AnonymousImageFolder,
+    BitstreamConvention,
+    encode_planes,
+)
+from src.compressors.frappe.harness.data import default_dataset_root
+from src.compressors.frappe.harness.reporting import write_report
+from src.compressors.frappe.openvino_runtime import (
+    FrappeDecoder,
+    FrappeEncoder,
+    available_devices,
+    testbed,
+)
+
+
+def as_torch_planes(planes):
+    """OpenVINO's ``(1, rows, cols)`` uint8 arrays as the harness's 2D tensors."""
+    import numpy as np
+    import torch
+
+    return [torch.from_numpy(np.ascontiguousarray(plane[0] if plane.ndim == 3 else plane))
+            for plane in planes]
 
 #: A trajectory has reached steady state at the first iteration from which every
 #: later one stays within this fraction of the steady median. "Every later one"
@@ -167,7 +185,7 @@ def parse_args(argv=None):
     parser = argparse.ArgumentParser(description=__doc__,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--onnx-stem", type=Path, required=True)
-    parser.add_argument("--dataset-root", type=Path, required=True)
+    parser.add_argument("--dataset-root", type=Path, default=default_dataset_root())
     parser.add_argument("--split", default="validation")
     parser.add_argument("--index", type=int, default=0)
     parser.add_argument("--devices", nargs="+", default=None,
@@ -200,7 +218,7 @@ def main(argv=None) -> None:
     properties = json.loads(args.properties) if args.properties else {}
     devices = args.devices or available_devices(core)
 
-    image = load_image(args.dataset_root, args.split, args.index)
+    image = AnonymousImageFolder(args.dataset_root, args.split).pixels(args.index).numpy()
     _batch, _channels, height, width = image.shape
     print(f"{width}x{height}, {args.split} split index {args.index}, devices {devices}")
     print(f"{args.iterations} back-to-back + {args.isolated_iterations} at "
@@ -226,13 +244,14 @@ def main(argv=None) -> None:
             try:
                 table[device] = profile_stage(build, feed, args.iterations,
                                               args.isolated_iterations, args.gap)
-            except Exception as error:  # noqa: BLE001 -- a rejection is a result
+            except Exception as error:
                 table[device] = {"error": f"{type(error).__name__}: {error}"}
                 print(f"    {table[device]['error'][:110]}")
 
+    tensors = as_torch_planes(planes)
     started = time.perf_counter()
     for _ in range(max(1, args.iterations // 4)):
-        encode_planes(planes, length_prefix=True)
+        encode_planes(tensors, BitstreamConvention.WITH_LENGTH_PREFIX)
     jpegls_ms = (time.perf_counter() - started) / max(1, args.iterations // 4) * 1000.0
 
     pixels = height * width
@@ -268,11 +287,15 @@ def main(argv=None) -> None:
                 + decoders[best_decoder]["steady_median_ms"])
         summary = {"encoder": best_encoder, "decoder": best_decoder,
                    "warm_total_ms": warm, "warm_mpixel_s": pixels / warm / 1000}
+        compile_cost = (encoders[best_encoder]["compile_ms"]
+                        + decoders[best_decoder]["compile_ms"])
+        ramp_cost = (encoders[best_encoder]["ramp_excess_ms"]
+                     + decoders[best_decoder]["ramp_excess_ms"])
         print(f"\nfastest warm round trip: encode on {best_encoder}, JPEG-LS on CPU, "
               f"decode on {best_decoder}\n  {warm:.2f} ms "
               f"({pixels / warm / 1000:.1f} Mpixel/s) once both graphs are warm. "
-              f"Cold, add {encoders[best_encoder]['compile_ms'] + decoders[best_decoder]['compile_ms']:.0f} ms "
-              f"of compilation and {encoders[best_encoder]['ramp_excess_ms'] + decoders[best_decoder]['ramp_excess_ms']:.0f} ms of ramp.")
+              f"Cold, add {compile_cost:.0f} ms of compilation "
+              f"and {ramp_cost:.0f} ms of ramp.")
 
     report = {
         "onnx_stem": str(args.onnx_stem),
@@ -289,10 +312,7 @@ def main(argv=None) -> None:
         "cache_dir_used": bool(args.cache_dir),
         "testbed": testbed(core),
     }
-    if args.report:
-        args.report.parent.mkdir(parents=True, exist_ok=True)
-        args.report.write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
-        print(f"\nwrote {args.report}")
+    write_report(report, args.report)
 
 
 if __name__ == "__main__":

@@ -33,6 +33,7 @@ only because that module pulls in torch; ``tests`` asserts the two agree.
 
 from __future__ import annotations
 
+import platform
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -123,8 +124,39 @@ def available_devices(core=None) -> list[str]:
             if device.split(".")[0] not in META_DEVICES]
 
 
+def testbed(core=None) -> dict:
+    """What a latency number was measured on.
+
+    Device timings here vary by an order of magnitude between machines and by a
+    factor of two between driver versions, so a report that does not carry this
+    is not reproducible. It lives beside the device code rather than in the
+    reporting helpers because it is entirely about OpenVINO's view of the
+    machine.
+    """
+    import openvino
+
+    resolved = _core(core)
+    devices = {}
+    for device in available_devices(resolved):
+        entry = {}
+        for name in ("FULL_DEVICE_NAME", "OPTIMIZATION_CAPABILITIES"):
+            try:
+                value = resolved.get_property(device, name)
+            except Exception as error:
+                value = f"<unavailable: {type(error).__name__}>"
+            entry[name.lower()] = list(value) if isinstance(value, (list, tuple)) else value
+        devices[device] = entry
+    return {
+        "hostname": platform.node(),
+        "os": platform.platform(),
+        "python_version": platform.python_version(),
+        "openvino_version": openvino.__version__,
+        "devices": devices,
+    }
+
+
 def _reject_meta(device: str) -> None:
-    if device.split(".")[0].upper() in META_DEVICES:
+    if device.split(".", maxsplit=1)[0].upper() in META_DEVICES:
         raise ValueError(
             f"{device!r} is an OpenVINO meta-device: it selects a device at run time, "
             "which defeats naming one. Pass a concrete device, or a preference list "
@@ -135,7 +167,7 @@ def require_device(device: str, core=None) -> str:
     """Return ``device`` if it can run here, else raise. Never substitutes."""
     _reject_meta(device)
     present = available_devices(core)
-    if device in present or device.split(".")[0] in present:
+    if device in present or device.split(".", maxsplit=1)[0] in present:
         return device
     raise DeviceUnavailableError(
         f"OpenVINO does not enumerate {device!r} on this machine; it has {present}")

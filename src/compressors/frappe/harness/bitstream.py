@@ -21,6 +21,7 @@ from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 from typing import ClassVar
 
+import numpy as np
 import torch
 
 from .annotations import Int8, Shaped, Tensor, UInt8, checked
@@ -133,6 +134,39 @@ def encode_planes(planes: Sequence[Tensor],
             chunks.append(struct.pack(">I", len(payload)))
         chunks.append(payload)
     return b"".join(chunks)
+
+
+def decode_planes(blob: bytes) -> list[UInt8[Tensor, "rows cols"]]:
+    """Read a self-describing blob back into arranged planes.
+
+    Only the ``WITH_LENGTH_PREFIX`` form can be read: without the prefixes the
+    concatenation is not self-describing, and where one stream ends is exactly
+    what the prefixes record. The count of scale groups stays implicit -- the
+    reader walks until the buffer is exhausted, as
+    ``entropy_coding.decode_latents`` does.
+
+    The planes come back unsigned, the form :func:`arrange_planes` produces and
+    the exported encoder graph emits, so a round trip through JPEG-LS can be
+    compared without a shift in between.
+    """
+    import pillow_jpls  # noqa: F401 -- registers the JPEG-LS plugin with PIL
+    from PIL import Image
+
+    planes: list[Tensor] = []
+    offset, total = 0, len(blob)
+    while offset < total:
+        if offset + LENGTH_PREFIX_BYTES > total:
+            raise ValueError("truncated blob: missing the 4-byte length prefix")
+        (length,) = struct.unpack_from(">I", blob, offset)
+        offset += LENGTH_PREFIX_BYTES
+        if offset + length > total:
+            raise ValueError(
+                f"truncated blob: a chunk of {length} bytes overruns the buffer")
+        with Image.open(io.BytesIO(blob[offset:offset + length])) as handle:
+            handle.load()
+            planes.append(torch.from_numpy(np.asarray(handle, dtype=np.uint8).copy()))
+        offset += length
+    return planes
 
 
 def measure_rate(latents: Iterable[Tensor], pixels: int,
