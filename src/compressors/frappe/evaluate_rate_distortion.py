@@ -22,14 +22,12 @@ import uuid
 from pathlib import Path
 
 import numpy as np
-import PIL.Image
 import torch
 from torchvision.transforms.v2.functional import pil_to_tensor
 
 from . import entropy_coding as default_entropy_coding
 from .model import load_from_hub, load_progressive_model
 from .quantize import srgb_to_linear
-
 
 METRICS = ("bpp", "PSNR_dB", "SSIM", "LPIPS_dB", "DISTS_dB")
 NULL_FALLBACKS = {

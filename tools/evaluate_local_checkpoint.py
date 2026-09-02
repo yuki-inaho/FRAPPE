@@ -26,8 +26,8 @@ REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
 if str(REPOSITORY_ROOT) not in sys.path:
     sys.path.insert(0, str(REPOSITORY_ROOT))
 
-from train_rae_progressive import validate
 from src.compressors.frappe.model import MergedAutoencoder
+from train_rae_progressive import validate
 
 
 def _load_snapshot(checkpoint, config, n_ch, device):

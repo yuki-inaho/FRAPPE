@@ -2,6 +2,7 @@
 rewrite references in the built HTML, and delete the original PNGs."""
 
 from pathlib import Path
+
 from PIL import Image
 
 

@@ -34,6 +34,7 @@ from __future__ import annotations
 import argparse
 import io
 import json
+import sys
 import time
 from pathlib import Path
 
@@ -42,6 +43,14 @@ import torch
 import torch.nn.functional as F
 from einops import rearrange
 from PIL import Image
+
+# Running ``python tools/<name>.py`` puts ``tools/`` on sys.path rather than the
+# repository root, so the documented invocation is made self-contained here.
+REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
+if str(REPOSITORY_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPOSITORY_ROOT))
+
+from src.compressors.frappe.harness.data import default_dataset_root
 
 DEFAULT_PS = [32, 32, 32, 16, 16, 16, 16, 16, 16, 8, 8, 8,
               4, 4, 4, 4, 4, 4, 2, 2, 2]
@@ -190,7 +199,10 @@ def joint_linear_bound(fit: torch.Tensor, evaluate: torch.Tensor, groups,
     for step in range(steps):
         index = torch.randint(0, fit.shape[0], (min(batch, fit.shape[0]),), device=device)
         loss = F.mse_loss(reconstruct(fit[index]), fit[index])
-        optimizer.zero_grad(); loss.backward(); optimizer.step(); schedule.step()
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
+        schedule.step()
         if verbose and (step % max(steps // 8, 1) == 0 or step == steps - 1):
             with torch.no_grad():
                 value = psnr(evaluate, reconstruct(evaluate).clamp(-1, 1))
@@ -221,10 +233,40 @@ def free_pca_bound(fit: torch.Tensor, evaluate: torch.Tensor, ps_list: list[int]
             "fraction_of_dimension": symbols / float(fit_rows.shape[1])}
 
 
-def main() -> None:
+def print_summary(args: argparse.Namespace, report: dict) -> None:
+    """The three bounds side by side, and the two gaps between them.
+
+    The gap from greedy to joint is what stagewise ordering costs; the gap
+    from joint to free PCA is what the FRAPPE structure costs. Printing the
+    subtractions is the point of running all three.
+    """
+    print(f"\n  schedule: {len(args.ps)} channels, "
+          f"{report['raw_int8_bpp']:.3f} raw int8 bpp")
+    greedy = report["bounds"].get("greedy_klt")
+    if greedy:
+        print(f"  greedy-KLT (stagewise ideal)   float {greedy['psnr_db']:6.2f} dB"
+              f"   int8 {greedy['int8_psnr_db']:6.2f} dB"
+              f"   {greedy['measured_jpegls_bpp']:6.3f} bpp"
+              f"   CR {greedy['compression_ratio']:5.2f}")
+    joint = report["bounds"].get("joint_linear")
+    if joint:
+        print(f"  joint-linear (same structure)  float {joint['psnr_db']:6.2f} dB")
+    free = report["bounds"].get("free_pca")
+    if free:
+        print(f"  free PCA (linear upper bound)  float {free['psnr_db']:6.2f} dB"
+              f"   ({free['symbols_per_block']}/{free['block_dimension']} dims kept)")
+    if greedy and joint:
+        print(f"\n  cost of greedy stagewise ordering: "
+              f"{joint['psnr_db'] - greedy['psnr_db']:+.2f} dB")
+    if joint and free:
+        print(f"  cost of the FRAPPE structural constraint: "
+              f"{free['psnr_db'] - joint['psnr_db']:+.2f} dB")
+
+
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--dataset-root", type=Path,
-                        default=Path("/workspace/data/frappe_rgb_800x608/imagefolder"))
+    parser.add_argument("--dataset-root", type=Path, default=default_dataset_root(),
+                        help="anonymous ImageFolder root; defaults to $FRAPPE_DATASET_ROOT")
     parser.add_argument("--split", default="validation")
     parser.add_argument("--images", type=int, default=32)
     parser.add_argument("--fit-images", type=int, default=96,
@@ -245,7 +287,11 @@ def main() -> None:
                         help="block size for the unconstrained bound; default: max(--ps)")
     parser.add_argument("--output", type=Path, default=None)
     parser.add_argument("--quiet", action="store_true")
-    args = parser.parse_args()
+    return parser.parse_args(argv)
+
+
+def main(argv: list[str] | None = None) -> None:
+    args = parse_args(argv)
 
     device = args.device if torch.cuda.is_available() else "cpu"
     groups = scale_groups(args.ps)
@@ -256,7 +302,7 @@ def main() -> None:
                     args.joint_fit_images if "joint-linear" in args.bounds else 0)
     fit = load_images(args.dataset_root, "train", fit_count, device)
     evaluate = load_images(args.dataset_root, args.split, args.images, device)
-    b, c, h, w = evaluate.shape
+    b, _c, h, w = evaluate.shape
     verbose = not args.quiet
     if verbose:
         print(f"fit={tuple(fit.shape)} eval={tuple(evaluate.shape)} groups={groups}", flush=True)
@@ -299,26 +345,7 @@ def main() -> None:
 
     report["seconds"] = time.time() - started
 
-    print(f"\n  schedule: {len(args.ps)} channels, {raw_bpp:.3f} raw int8 bpp")
-    greedy = report["bounds"].get("greedy_klt")
-    if greedy:
-        print(f"  greedy-KLT (stagewise ideal)   float {greedy['psnr_db']:6.2f} dB"
-              f"   int8 {greedy['int8_psnr_db']:6.2f} dB"
-              f"   {greedy['measured_jpegls_bpp']:6.3f} bpp"
-              f"   CR {greedy['compression_ratio']:5.2f}")
-    joint = report["bounds"].get("joint_linear")
-    if joint:
-        print(f"  joint-linear (same structure)  float {joint['psnr_db']:6.2f} dB")
-    free = report["bounds"].get("free_pca")
-    if free:
-        print(f"  free PCA (linear upper bound)  float {free['psnr_db']:6.2f} dB"
-              f"   ({free['symbols_per_block']}/{free['block_dimension']} dims kept)")
-    if greedy and joint:
-        print(f"\n  cost of greedy stagewise ordering: "
-              f"{joint['psnr_db'] - greedy['psnr_db']:+.2f} dB")
-    if joint and free:
-        print(f"  cost of the FRAPPE structural constraint: "
-              f"{free['psnr_db'] - joint['psnr_db']:+.2f} dB")
+    print_summary(args, report)
 
     if args.output:
         args.output.parent.mkdir(parents=True, exist_ok=True)

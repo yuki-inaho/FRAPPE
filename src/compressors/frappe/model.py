@@ -11,6 +11,7 @@ refresh by re-copying from https://github.com/danjacobellis/gigatorch
 """
 
 import torch
+
 from .ops import adapt_to_decoder, decoder_channels_per_encoder, get_scale_groups
 from .quantize import make_quantizer
 
@@ -307,6 +308,7 @@ def load_from_hub(repo_id="danjacobellis/FRAPPE", subdir="FRAPPE"):
     folder inside the repo holding the two files."""
     import json
     from types import SimpleNamespace
+
     from huggingface_hub import hf_hub_download
     from safetensors.torch import load_file
 

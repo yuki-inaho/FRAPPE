@@ -1,10 +1,11 @@
 """Evaluation helpers for FRAPPE checkpoints."""
 
 import io
+
 import numpy as np
-import torch
 import PIL.Image
 import pillow_jpls  # noqa: F401 — registers JPEG-LS codec with PIL
+import torch
 from torchvision.transforms.v2.functional import pil_to_tensor, to_pil_image
 
 from .quantize import srgb_to_linear

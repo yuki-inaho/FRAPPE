@@ -17,7 +17,6 @@ pure upside and is done by re-running the trainer on the emitted checkpoint with
 from __future__ import annotations
 
 import argparse
-import json
 import sys
 import time
 from pathlib import Path
@@ -28,44 +27,24 @@ REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
 if str(REPOSITORY_ROOT) not in sys.path:
     sys.path.insert(0, str(REPOSITORY_ROOT))
 
-from src.compressors.frappe.experiment import atomic_json_dump, atomic_torch_save  # noqa: E402
-from src.compressors.frappe.prefix import prune_channels  # noqa: E402
-from tools.evaluate_joint_prefix import load_checkpoint  # noqa: E402
-from tools.prune_latent_channels import (  # noqa: E402
-    PROXY_CRITERIA, RateMeter, channel_rates, greedy_frontier, load_images, measure,
-    proxy_scores, select_by_score)
+from src.compressors.frappe.experiment import atomic_json_dump, atomic_torch_save
+from src.compressors.frappe.harness.checkpoints import load_checkpoint
+from src.compressors.frappe.harness.data import default_dataset_root
+from src.compressors.frappe.harness.pruning import (
+    PROXY_CRITERIA,
+    RateMeter,
+    channel_rates,
+    greedy_frontier,
+    load_images,
+    measure,
+    proxy_scores,
+)
+from src.compressors.frappe.prefix import prune_channels
 
 
-def main() -> None:
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--checkpoint", type=Path, required=True)
-    parser.add_argument("--output-checkpoint", type=Path, required=True)
-    parser.add_argument("--target-channels", type=int, default=None)
-    parser.add_argument("--keep", type=int, nargs="+", default=None,
-                        help="explicit 1-based channel list; overrides --target-channels")
-    parser.add_argument("--criterion", default="oracle",
-                        choices=["oracle", *PROXY_CRITERIA])
-    parser.add_argument("--dataset-root", type=Path,
-                        default=Path("/workspace/data/frappe_rgb_800x608/imagefolder"))
-    parser.add_argument("--split", default="validation")
-    parser.add_argument("--images", type=int, default=8)
-    parser.add_argument("--device", default="cuda:0")
-    parser.add_argument("--report", type=Path, default=None)
-    args = parser.parse_args()
-
-    if args.keep is None and args.target_channels is None:
-        raise SystemExit("give either --target-channels or --keep")
-
-    device = args.device if torch.cuda.is_available() else "cpu"
-    model, config, state = load_checkpoint(args.checkpoint, device)
-    images = load_images(args.dataset_root, args.split, args.images, device)
-    with torch.no_grad():
-        codes_cache = [model.integer_codes(x) for x in images]
-    meter = RateMeter(model)
-    started = time.time()
-    print(f"source: {args.checkpoint} (iteration {state.get('iteration')}), "
-          f"{model.n_channels} channels", flush=True)
-
+def select_channels(model, images, codes_cache, meter, args
+                    ) -> tuple[list[int], str, list | None]:
+    """Decide what to keep, and say by what authority."""
     frontier = None
     if args.keep is not None:
         kept = sorted({int(channel) for channel in args.keep})
@@ -77,14 +56,24 @@ def main() -> None:
         kept, selection = point["channels"], "oracle"
     else:
         rates = channel_rates(model, images, codes_cache, meter)
-        scores = proxy_scores(model, images, codes_cache, device)[args.criterion]
+        scores = proxy_scores(model, images, codes_cache)[args.criterion]
         order = sorted(range(model.n_channels), key=lambda i: -(scores[i] / rates[i]))
         kept = sorted(index + 1 for index in order[:args.target_channels])
         selection = args.criterion
     print(f"\n  keeping {len(kept)} channels by {selection}: {kept}", flush=True)
 
-    before_psnr, before_bpp = measure(model, images, codes_cache, meter, kept)
-    pruned = prune_channels(model, kept, config).eval()
+    return kept, selection, frontier
+
+
+def verify_equivalence(model, pruned, images, codes_cache, kept
+                       ) -> tuple[bool, float, float, float]:
+    """Pruning is a size change, so the codes must not move at all.
+
+    The integer codes are the bitstream; if they differ the pruned model is a
+    different codec. The float reconstruction is held to a weaker bar because the
+    narrower first convolution sums its channels in a different order.
+    """
+    from src.compressors.frappe.harness.pruning import RateMeter, measure
 
     # Equivalence is a claim about the pruning code, so it is checked, not asserted.
     #
@@ -114,6 +103,49 @@ def main() -> None:
             worst = max(worst, (reference - candidate).abs().max().item())
     after_psnr, after_bpp = measure(pruned, images, [pruned.integer_codes(x) for x in images],
                                     RateMeter(pruned), list(range(1, pruned.n_channels + 1)))
+    return codes_match, worst, after_psnr, after_bpp
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--checkpoint", type=Path, required=True)
+    parser.add_argument("--output-checkpoint", type=Path, required=True)
+    parser.add_argument("--target-channels", type=int, default=None)
+    parser.add_argument("--keep", type=int, nargs="+", default=None,
+                        help="explicit 1-based channel list; overrides --target-channels")
+    parser.add_argument("--criterion", default="oracle",
+                        choices=["oracle", *PROXY_CRITERIA])
+    parser.add_argument("--dataset-root", type=Path, default=default_dataset_root(),
+                        help="anonymous ImageFolder root; defaults to $FRAPPE_DATASET_ROOT")
+    parser.add_argument("--split", default="validation")
+    parser.add_argument("--images", type=int, default=8)
+    parser.add_argument("--device", default="cuda:0")
+    parser.add_argument("--report", type=Path, default=None)
+    args = parser.parse_args()
+
+    if args.keep is None and args.target_channels is None:
+        raise SystemExit("give either --target-channels or --keep")
+
+    device = args.device if torch.cuda.is_available() else "cpu"
+    checkpoint = load_checkpoint(args.checkpoint, device)
+    model, config, state = checkpoint.model, checkpoint.config, checkpoint.state
+    images = load_images(args.dataset_root, args.split, args.images, device)
+    with torch.no_grad():
+        codes_cache = [model.integer_codes(x) for x in images]
+    meter = RateMeter(model)
+    started = time.time()
+    print(f"source: {args.checkpoint} (iteration {state.get('iteration')}), "
+          f"{model.n_channels} channels", flush=True)
+
+    kept, selection, frontier = select_channels(
+        model, images, codes_cache, meter, args)
+    print(f"\n  keeping {len(kept)} channels by {selection}: {kept}", flush=True)
+
+    before_psnr, before_bpp = measure(model, images, codes_cache, meter, kept)
+    pruned = prune_channels(model, kept, config).eval()
+
+    codes_match, worst, after_psnr, after_bpp = verify_equivalence(
+        model, pruned, images, codes_cache, kept)
     print(f"  integer codes bit-identical: {codes_match}")
     print(f"  PSNR  masked {before_psnr:.4f} dB  vs pruned {after_psnr:.4f} dB "
           f"(difference {after_psnr - before_psnr:+.4f} dB)")

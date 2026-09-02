@@ -14,6 +14,11 @@ einops = "*"
 matplotlib = "*"
 jupyterlab = "*"
 
+[activation.env]
+# The repository root on the path, so `pixi run python ...` can import
+# `src` and `tools` from anywhere without each script bootstrapping it.
+PYTHONPATH = "."
+
 [tasks]
 train = "python train_rae_progressive.py"
 train-managed = "python train_managed.py"

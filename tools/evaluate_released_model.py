@@ -15,7 +15,6 @@ reformulation removes.
 from __future__ import annotations
 
 import argparse
-import io
 import json
 import math
 import sys
@@ -31,31 +30,17 @@ REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
 if str(REPOSITORY_ROOT) not in sys.path:
     sys.path.insert(0, str(REPOSITORY_ROOT))
 
-from src.compressors.frappe.model import load_from_hub, load_progressive_model  # noqa: E402
-from src.compressors.frappe.quantize import srgb_to_linear  # noqa: E402
-
-
-def jpegls_bytes(latents: list[torch.Tensor]) -> int:
-    """FRAPPE's shipped layout: one grayscale JPEG-LS image per scale group."""
-    import pillow_jpls  # noqa: F401
-    from torchvision.transforms.v2.functional import to_pil_image
-
-    total = 0
-    for z in latents:
-        plane = z[0]
-        flat = plane.reshape(plane.shape[0] * plane.shape[1], plane.shape[2])
-        buffer = io.BytesIO()
-        to_pil_image((flat.to(torch.long) + 127).to(torch.uint8)).save(
-            buffer, format="JPEG-LS")
-        total += len(buffer.getbuffer())
-    return total
+from src.compressors.frappe.harness.bitstream import measure_rate
+from src.compressors.frappe.harness.data import default_dataset_root
+from src.compressors.frappe.model import load_from_hub, load_progressive_model
+from src.compressors.frappe.quantize import srgb_to_linear
 
 
 @torch.no_grad()
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--dataset-root", type=Path,
-                        default=Path("/workspace/data/frappe_rgb_800x608/imagefolder"))
+    parser.add_argument("--dataset-root", type=Path, default=default_dataset_root(),
+                        help="anonymous ImageFolder root; defaults to $FRAPPE_DATASET_ROOT")
     parser.add_argument("--split", default="validation")
     parser.add_argument("--images", type=int, default=16)
     parser.add_argument("--prefixes", type=int, nargs="+", default=None,
@@ -97,7 +82,7 @@ def main() -> None:
             latents = [z.round().clamp(-127, 127).to(torch.int8) for z in model.encode(x_in)]
             recon = model.decode([z.to(torch.float) for z in latents]).clamp(-1, 1)
             total_mse += F.mse_loss(x / 2 + 0.5, recon / 2 + 0.5).item()
-            total_bytes += jpegls_bytes(latents)
+            total_bytes += measure_rate(latents, height * width)[0]
         mse = total_mse / len(images)
         bpp = total_bytes * 8 / (len(images) * height * width)
         point = {"channels": n, "psnr_db": -10.0 * math.log10(max(mse, 1e-12)),

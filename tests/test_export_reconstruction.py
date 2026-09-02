@@ -1,8 +1,8 @@
 from types import SimpleNamespace
 
 import pytest
-from PIL import Image
 import torch
+from PIL import Image
 
 from tools.export_local_reconstruction import (
     image_psnr,

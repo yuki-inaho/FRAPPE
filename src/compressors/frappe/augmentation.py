@@ -22,7 +22,6 @@ import cv2
 import numpy as np
 from PIL import Image
 
-
 # This explicit allow-list makes misspelled configuration names fail before a
 # long GPU run starts, rather than silently dropping an augmentation.
 SUPPORTED_TRANSFORMS = {
@@ -75,7 +74,7 @@ class RGBTrainingAugmentation:
         self.transforms = _build_transforms(self.spec)
 
     @classmethod
-    def from_json(cls, value: str) -> "RGBTrainingAugmentation":
+    def from_json(cls, value: str) -> RGBTrainingAugmentation:
         try:
             spec = json.loads(value)
         except json.JSONDecodeError as error:

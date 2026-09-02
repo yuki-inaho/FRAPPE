@@ -47,7 +47,6 @@ traced at is the failure this export is written to avoid.
 from __future__ import annotations
 
 import argparse
-import io
 import json
 import sys
 import time
@@ -60,13 +59,16 @@ REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
 if str(REPOSITORY_ROOT) not in sys.path:
     sys.path.insert(0, str(REPOSITORY_ROOT))
 
-from src.compressors.frappe.entropy_coding import arrange_latents, encode_latents  # noqa: E402
-from tools.evaluate_joint_prefix import load_checkpoint  # noqa: E402
-from tools.prune_latent_channels import load_images  # noqa: E402
-
-#: Codes are signed 8-bit; JPEG-LS wants unsigned 8-bit, so the streams carry
-#: ``code + CODE_OFFSET``.  Kept as a name because it appears on both sides.
-CODE_OFFSET = 127.0
+from src.compressors.frappe.harness import AnonymousImageFolder
+from src.compressors.frappe.harness.bitstream import (
+    CODE_OFFSET,
+    BitstreamConvention,
+    arrange_planes,
+    encode_plane,
+    encode_planes,
+)
+from src.compressors.frappe.harness.checkpoints import load_checkpoint
+from src.compressors.frappe.harness.data import default_dataset_root
 
 
 class EncoderGraph(torch.nn.Module):
@@ -120,16 +122,6 @@ class DecoderGraph(torch.nn.Module):
                 torch.round((reconstruction.clamp(-1.0, 1.0) / 2 + 0.5) * 255.0),
                 0.0, 255.0).to(torch.uint8)
         return reconstruction
-
-
-def jpegls_payload(plane: np.ndarray) -> bytes:
-    """The bare JPEG-LS stream for one already-arranged uint8 grayscale plane."""
-    import pillow_jpls  # noqa: F401
-    from PIL import Image
-
-    buffer = io.BytesIO()
-    Image.fromarray(plane, mode="L").save(buffer, format="JPEG-LS")
-    return buffer.getvalue()
 
 
 def dynamic_shapes(model, max_units: int = 4096):
@@ -213,6 +205,115 @@ def describe(path: Path) -> dict:
             "opset": model.opset_import[0].version}
 
 
+def verify_against_reference(model, decoder, folder, encoder_session, decoder_session,
+                             plane_names, count, uint8_io) -> dict:
+    """The exported encoder must reproduce the reference bitstream exactly.
+
+    Not "closely": the planes are the bytes JPEG-LS receives, so anything short
+    of byte identity is a different codec. The decoder is held to a weaker bar
+    on purpose -- it reduces channels in a different order than PyTorch does, so
+    a float32 value on a rounding boundary lands on either side of it.
+    """
+    worst_plane = worst_recon = 0
+    mismatched = symbols = payload_mismatch = 0
+    differing_pixels = total_pixels = 0
+    reference_blob = 0
+    for index in range(min(count, len(folder))):
+        x = folder.signed(index)
+        codes = model.integer_codes(x)
+        reference_planes = [plane.numpy() for plane in arrange_planes(codes)]
+        if index == 0:
+            reference_blob = len(encode_planes(
+                arrange_planes(codes), BitstreamConvention.WITH_LENGTH_PREFIX))
+        feed = folder.pixels(index).numpy() if uint8_io else x.numpy()
+        onnx_planes = encoder_session.run(None, {"image": feed})
+        for reference, candidate in zip(reference_planes, onnx_planes):
+            emitted = candidate[0] if uint8_io else (
+                candidate[0].astype(np.int32) + int(CODE_OFFSET)).astype(np.uint8)
+            worst_plane = max(worst_plane, int(np.abs(
+                emitted.astype(np.int32) - reference.astype(np.int32)).max()))
+            mismatched += int((emitted != reference).sum())
+            symbols += reference.size
+            if encode_plane(torch.from_numpy(emitted)) != encode_plane(
+                    torch.from_numpy(reference)):
+                payload_mismatch += 1
+        onnx_recon, = decoder_session.run(
+            None, dict(zip(plane_names, onnx_planes)))
+        with torch.no_grad():
+            expected = decoder(*[torch.from_numpy(plane) for plane in onnx_planes])
+        difference = np.abs(expected.numpy().astype(np.float64)
+                            - onnx_recon.astype(np.float64))
+        worst_recon = max(worst_recon, float(difference.max()))
+        differing_pixels += int((difference > 0).sum())
+        total_pixels += int(difference.size)
+
+    print(f"\n  verified against src/compressors/frappe/entropy_coding.py "
+          f"on {min(count, len(folder))} images:")
+    print(f"    encoder planes : max |difference| = {worst_plane}   "
+          f"mismatched symbols = {mismatched}/{symbols}")
+    payload_note = ("byte-identical" if payload_mismatch == 0
+                    else f"{payload_mismatch} streams differ")
+    print(f"    JPEG-LS payload: {payload_note}   (reference blob for image 0: "
+          f"{reference_blob} B, length prefixes included)")
+    print(f"    decoder output : max |difference| vs PyTorch = {worst_recon:g}"
+          f"   differing = {differing_pixels}/{total_pixels}"
+          f" ({100 * differing_pixels / max(total_pixels, 1):.4f}%)")
+    if worst_plane or payload_mismatch:
+        raise SystemExit("ONNX encoder does not reproduce the reference bitstream")
+    if uint8_io and (worst_recon > 1 or differing_pixels > 1e-4 * total_pixels):
+        raise SystemExit("ONNX decoder output diverges from PyTorch")
+    if not uint8_io and worst_recon > 1e-3:
+        raise SystemExit("ONNX decoder output diverges from PyTorch")
+    return {"images": min(count, len(folder)), "max_plane_difference": worst_plane,
+            "mismatched_symbols": mismatched, "symbols": symbols,
+            "jpegls_streams_differing": payload_mismatch,
+            "max_reconstruction_difference": worst_recon,
+            "differing_pixels": differing_pixels, "total_pixels": total_pixels,
+            "reference_blob_bytes_image0": reference_blob}
+
+
+def verify_resolutions(model, encoder_session, decoder_session, plane_names, uint8_io,
+                       height: int, width: int) -> list[list[int]]:
+    """A graph that only runs at the traced size is the defect this export avoids."""
+    max_ps = max(model.ps)
+    sizes = [(height, width), (max_ps * 2, max_ps * 3), (max_ps * 10, max_ps * 15),
+             (1088, 1920)]
+    print("\n  same graphs re-run at other resolutions:")
+    for probe_height, probe_width in sizes:
+        probe = np.zeros((1, model.input_channels, probe_height, probe_width),
+                         dtype=np.uint8 if uint8_io else np.float32)
+        try:
+            planes = encoder_session.run(None, {"image": probe})
+            recon = decoder_session.run(None, dict(zip(plane_names, planes)))[0]
+            expected = (1, model.input_channels, probe_height, probe_width)
+            status = "ok" if tuple(recon.shape) == expected else f"shape {recon.shape}"
+        except Exception as error:
+            status = f"{type(error).__name__}: {error}"
+        print(f"    {probe_width:5d}x{probe_height:<5d} {status}")
+        if status != "ok":
+            raise SystemExit("the exported graphs are not resolution independent")
+    return [[w, h] for h, w in sizes]
+
+
+def measure_latency(encoder_session, decoder_session, plane_names, image,
+                    repeats: int) -> tuple[float, float]:
+    """Encode and decode wall-clock, warmed up, at the caller's thread count."""
+    feed = {"image": image.numpy()}
+    for _ in range(3):
+        planes = encoder_session.run(None, feed)
+    started = time.perf_counter()
+    for _ in range(repeats):
+        planes = encoder_session.run(None, feed)
+    encode_ms = (time.perf_counter() - started) / repeats * 1000
+    decoder_feed = dict(zip(plane_names, planes))
+    for _ in range(2):
+        decoder_session.run(None, decoder_feed)
+    started = time.perf_counter()
+    for _ in range(repeats):
+        decoder_session.run(None, decoder_feed)
+    return encode_ms, (time.perf_counter() - started) / repeats * 1000
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--checkpoint", type=Path, required=True)
@@ -222,8 +323,8 @@ def main() -> None:
     parser.add_argument("--io", choices=["uint8", "float"], default="uint8",
                         help="uint8: images and code planes as bytes, normalisation "
                              "inside the graph. float: [-1,1] images and int8 planes")
-    parser.add_argument("--dataset-root", type=Path,
-                        default=Path("/workspace/data/frappe_rgb_800x608/imagefolder"))
+    parser.add_argument("--dataset-root", type=Path, default=default_dataset_root(),
+                        help="anonymous ImageFolder root; defaults to $FRAPPE_DATASET_ROOT")
     parser.add_argument("--split", default="validation")
     parser.add_argument("--verify-images", type=int, default=4)
     parser.add_argument("--export-height", type=int, default=608)
@@ -239,7 +340,7 @@ def main() -> None:
     parser.add_argument("--report", type=Path, default=None)
     args = parser.parse_args()
 
-    model, config, state = load_checkpoint(args.checkpoint, "cpu")
+    model = load_checkpoint(args.checkpoint, "cpu").model
     model.eval()
     prefix = args.prefix or model.n_channels
     uint8_io = args.io == "uint8"
@@ -265,8 +366,7 @@ def main() -> None:
     decoder_info = export(decoder, sample_planes, decoder_path, plane_names,
                           ["reconstruction"], (plane_shapes,), args.opset, args.simplify)
 
-    for label, path, info in (("encoder", encoder_path, encoder_info),
-                              ("decoder", decoder_path, decoder_info)):
+    for path, info in ((encoder_path, encoder_info), (decoder_path, decoder_info)):
         note = (f"  simplified {info['nodes_before']} -> {info['nodes_after']} nodes, "
                 f"{info['bytes_before'] / 1e6:.2f} -> {info['bytes'] / 1e6:.2f} MB"
                 if info.get("simplified") else "  not simplified")
@@ -277,101 +377,17 @@ def main() -> None:
                 print(f"    {direction[:-1]:6s} {entry['name']:14s} "
                       f"{entry['dtype']:7s} {entry['shape']}")
 
-    # ---- verification against the reference bitstream path ----
-    images = load_images(args.dataset_root, args.split, args.verify_images, "cpu")
     encoder_session = session(encoder_path, args.threads)
     decoder_session = session(decoder_path, args.threads)
-    worst_plane, worst_recon, mismatched, symbols = 0, 0.0, 0, 0
-    payload_mismatch, differing_pixels, total_pixels = 0, 0, 0
-    for x in images:
-        # The reference: integer codes, the entropy coder's own arrangement, and
-        # the same shift encode_latents applies before handing bytes to JPEG-LS.
-        reference_codes = model.integer_codes(x)
-        reference_planes = [(plane.to(torch.long) + int(CODE_OFFSET)).to(torch.uint8).numpy()
-                            for plane in arrange_latents(reference_codes)]
-        feed = (x.mul(127.5).add(127.5).round().clamp(0, 255).to(torch.uint8).numpy()
-                if uint8_io else x.numpy())
-        onnx_planes = encoder_session.run(None, {"image": feed})
-        for reference, candidate in zip(reference_planes, onnx_planes):
-            emitted = candidate[0] if uint8_io else (
-                candidate[0].astype(np.int32) + int(CODE_OFFSET)).astype(np.uint8)
-            worst_plane = max(worst_plane, int(np.abs(
-                emitted.astype(np.int32) - reference.astype(np.int32)).max()))
-            mismatched += int((emitted != reference).sum())
-            symbols += reference.size
-            if jpegls_payload(emitted) != jpegls_payload(reference):
-                payload_mismatch += 1
-        onnx_recon, = decoder_session.run(
-            None, {name: plane for name, plane in zip(plane_names, onnx_planes)})
-        with torch.no_grad():
-            expected = decoder(*[torch.from_numpy(plane) for plane in onnx_planes])
-        difference = np.abs(expected.numpy().astype(np.float64)
-                            - onnx_recon.astype(np.float64))
-        worst_recon = max(worst_recon, float(difference.max()))
-        differing_pixels += int((difference > 0).sum())
-        total_pixels += int(difference.size)
-
-    reference_blob = len(encode_latents(arrange_latents(model.integer_codes(images[0]))))
-    print(f"\n  verified against src/compressors/frappe/entropy_coding.py "
-          f"on {len(images)} images:")
-    print(f"    encoder planes : max |difference| = {worst_plane}   "
-          f"mismatched symbols = {mismatched}/{symbols}")
-    print(f"    JPEG-LS payload: {'byte-identical' if payload_mismatch == 0 else
-                                  f'{payload_mismatch} streams differ'}"
-          f"   (reference blob for image 0: {reference_blob} B, length prefixes included)")
-    print(f"    decoder output : max |difference| vs PyTorch = {worst_recon:g}"
-          f"   differing = {differing_pixels}/{total_pixels}"
-          f" ({100 * differing_pixels / max(total_pixels, 1):.4f}%)")
-    if worst_plane or payload_mismatch:
-        raise SystemExit("ONNX encoder does not reproduce the reference bitstream")
-    # The encoder is gated on exactness because its output is the bitstream. The
-    # decoder cannot be: it sums a different number of channels in a different
-    # order than the traced graph, and a float32 value sitting on a rounding
-    # boundary then lands on either side of it. One code level on a handful of
-    # pixels is arithmetic, not a defect; anything larger, or anything
-    # widespread, is.
-    if uint8_io and (worst_recon > 1 or differing_pixels > 1e-4 * total_pixels):
-        raise SystemExit("ONNX decoder output diverges from PyTorch")
-    if not uint8_io and worst_recon > 1e-3:
-        raise SystemExit("ONNX decoder output diverges from PyTorch")
-
-    # A graph that only runs at the traced size is the defect this export exists
-    # to avoid, so the claim is tested rather than declared.
-    max_ps = max(model.ps)
-    resolutions = [(args.export_height, args.export_width),
-                   (max_ps * 2, max_ps * 3), (max_ps * 10, max_ps * 15),
-                   (1088, 1920)]
-    print("\n  same graphs re-run at other resolutions:")
-    for height, width in resolutions:
-        probe = np.zeros((1, model.input_channels, height, width),
-                         dtype=np.uint8 if uint8_io else np.float32)
-        try:
-            probe_planes = encoder_session.run(None, {"image": probe})
-            recon = decoder_session.run(
-                None, {name: plane for name, plane in zip(plane_names, probe_planes)})[0]
-            status = "ok" if tuple(recon.shape) == (1, model.input_channels, height, width) \
-                else f"unexpected output shape {recon.shape}"
-        except Exception as error:  # noqa: BLE001 -- the point is to report, not to raise
-            status = f"{type(error).__name__}: {error}"
-        print(f"    {width:5d}x{height:<5d} {status}")
-        if status != "ok":
-            raise SystemExit("the exported graphs are not resolution independent")
-
-    feed = {"image": (images[0].mul(127.5).add(127.5).round().clamp(0, 255)
-                      .to(torch.uint8).numpy() if uint8_io else images[0].numpy())}
-    for _ in range(3):
-        planes = encoder_session.run(None, feed)
-    started = time.perf_counter()
-    for _ in range(args.timing_repeats):
-        planes = encoder_session.run(None, feed)
-    encode_ms = (time.perf_counter() - started) / args.timing_repeats * 1000
-    decoder_feed = {name: plane for name, plane in zip(plane_names, planes)}
-    for _ in range(2):
-        decoder_session.run(None, decoder_feed)
-    started = time.perf_counter()
-    for _ in range(args.timing_repeats):
-        decoder_session.run(None, decoder_feed)
-    decode_ms = (time.perf_counter() - started) / args.timing_repeats * 1000
+    folder = AnonymousImageFolder(args.dataset_root, args.split)
+    verification = verify_against_reference(
+        model, decoder, folder, encoder_session, decoder_session,
+        plane_names, args.verify_images, uint8_io)
+    resolutions = verify_resolutions(model, encoder_session, decoder_session, plane_names,
+                                     uint8_io, args.export_height, args.export_width)
+    encode_ms, decode_ms = measure_latency(
+        encoder_session, decoder_session, plane_names,
+        folder.pixels(0) if uint8_io else folder.signed(0), args.timing_repeats)
     pixels = args.export_height * args.export_width
     print(f"\n  CPU latency at {args.export_width}x{args.export_height}, "
           f"{args.threads} thread(s):")
@@ -383,14 +399,8 @@ def main() -> None:
         "io": args.io, "opset": args.opset,
         "encoder": {"path": str(encoder_path), **encoder_info, **describe(encoder_path)},
         "decoder": {"path": str(decoder_path), **decoder_info, **describe(decoder_path)},
-        "verification": {"images": len(images), "max_plane_difference": worst_plane,
-                         "mismatched_symbols": mismatched, "symbols": symbols,
-                         "jpegls_streams_differing": payload_mismatch,
-                         "max_reconstruction_difference": worst_recon,
-                         "differing_pixels": differing_pixels,
-                         "total_pixels": total_pixels,
-                         "reference_blob_bytes_image0": reference_blob},
-        "resolutions_verified": [[w, h] for h, w in resolutions],
+        "verification": verification,
+        "resolutions_verified": resolutions,
         "cpu_latency_ms": {"encode": encode_ms, "decode": decode_ms,
                            "threads": args.threads,
                            "size": [args.export_width, args.export_height]},

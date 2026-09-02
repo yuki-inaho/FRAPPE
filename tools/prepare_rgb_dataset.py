@@ -16,13 +16,13 @@ import re
 import stat
 import tarfile
 import zipfile
+from collections.abc import Iterable
 from contextlib import AbstractContextManager
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
-from typing import BinaryIO, Iterable
+from typing import BinaryIO
 
 from PIL import Image
-
 
 IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png", ".tif", ".tiff", ".bmp"}
 GENERATED_IMAGE = re.compile(r"^image_[0-9]{8}\.png$")
@@ -163,7 +163,7 @@ def _write_clean_png(stream: BinaryIO, destination: Path) -> tuple[int, int]:
         clean = Image.frombytes("RGB", converted.size, converted.tobytes())
     temporary = destination.with_name(f".{destination.name}.tmp")
     clean.save(temporary, format="PNG", compress_level=1)
-    os.replace(temporary, destination)
+    temporary.replace(destination)
     return clean.size
 
 
@@ -219,7 +219,7 @@ def _link_generated_view(source_files: Iterable[Path], destination: Path) -> int
         expected.add(name)
         target = destination / name
         if target.exists():
-            if os.path.samefile(source, target):
+            if source.samefile(target):
                 continue
             target.unlink()
         os.link(source, target)

@@ -33,7 +33,6 @@ import pillow_jpls  # noqa: F401 -- registers the JPEG-LS plugin with PIL
 import torch
 from torchvision.transforms.v2.functional import pil_to_tensor, to_pil_image
 
-
 # Type alias. The default arrangement is a list of 2D int8 tensors, one per
 # scale, each shaped ``(C * H, W)``.
 ArrangedLatents = list

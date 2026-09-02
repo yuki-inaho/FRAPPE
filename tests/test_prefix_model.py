@@ -370,8 +370,8 @@ def test_adapt_to_decoder_matches_the_einops_formulation(encoder_ps, decoder_ps)
     image size into the exported graph; pixel_unshuffle and repeat_interleave do
     not. They are only an acceptable substitution if they agree exactly.
     """
-    import torch.nn.functional as functional
     from einops import rearrange
+    from torch.nn import functional
 
     from src.compressors.frappe.ops import adapt_to_decoder
 

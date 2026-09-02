@@ -16,18 +16,17 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import torch
-import torch.nn.functional as functional
 from timm.optim import Adan
+from torch.nn import functional
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
 if str(REPOSITORY_ROOT) not in sys.path:
     sys.path.insert(0, str(REPOSITORY_ROOT))
 
+from src.compressors.frappe.experiment import ModelEMA
 from src.compressors.frappe.model import MergedAutoencoder
 from src.compressors.frappe.ops import decoder_channels_per_encoder, get_scale_groups
-from src.compressors.frappe.experiment import ModelEMA
 from train_rae_progressive import make_amuse_optimizer
-
 
 PROFILES = {
     "managed_9ch": {
@@ -100,15 +99,16 @@ def measure(config: SimpleNamespace, batch_size: int, height: int, width: int,
         optimizer = Adan(model.decoder.parameters(), lr=5e-4)
     ema = ModelEMA(model, ema_decay) if ema_decay > 0 else None
 
-    def merged_forward(images):
-        with torch.no_grad():
-            latents = [latent.round() for latent in model.encode(images)]
-        return model.decode(latents)
-
     x = torch.rand(batch_size, 3, height, width, device=device).mul_(2).sub_(1)
     torch.cuda.empty_cache()
     torch.cuda.reset_peak_memory_stats(device)
-    prediction = merged_forward(x)
+    # Inlined rather than wrapped in a closure: the closure captured ``model``
+    # by cell, and the ``del`` below that frees the GPU memory emptied that cell,
+    # so any second call would have raised NameError. Used once, so a function
+    # bought nothing and cost a latent bug.
+    with torch.no_grad():
+        latents = [latent.round() for latent in model.encode(x)]
+    prediction = model.decode(latents)
     loss = functional.mse_loss(prediction, x)
     optimizer.zero_grad(set_to_none=True)
     loss.backward()
@@ -122,7 +122,7 @@ def measure(config: SimpleNamespace, batch_size: int, height: int, width: int,
     reserved = torch.cuda.max_memory_reserved(device) / (1024 ** 3)
     result = {"batch_size": batch_size, "peak_allocated_gib": peak,
               "peak_reserved_gib": reserved, "loss": float(loss.item())}
-    del x, prediction, loss, ema, optimizer, model
+    del x, latents, prediction, loss, ema, optimizer, model
     gc.collect()
     torch.cuda.empty_cache()
     return result

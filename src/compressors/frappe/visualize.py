@@ -1,9 +1,9 @@
 """Filter visualization for RAE encoder models."""
 
-import torch
-import numpy as np
 import einops
+import numpy as np
 import PIL.Image
+import torch
 from sympy import divisors
 from torchvision.transforms.v2.functional import to_pil_image
 
@@ -21,7 +21,7 @@ def make_filter_grid(filters, biases, n_channels, layout=None):
     filters_grid = weights_grid + biases_grid / torch.prod(torch.tensor(filters.shape[-3:]))
     filters_norm = filters_grid / (8 * filters_grid.std()) + 0.5
     pad = 1
-    c, h, w = filters.shape[1], filters.shape[2], filters.shape[3]
+    h, w = filters.shape[2], filters.shape[3]
     ph, pw = h + pad, w + pad
     canvas = torch.zeros(4, gh * ph + pad, gw * pw + pad)
     for r in range(gh):
@@ -57,7 +57,19 @@ def extract_filter_grids(merged, n_channels):
 
 
 def display_filter_grids(merged, n_channels, scale=10):
-    """Extract and display filter grids from a merged encoder."""
+    """Extract and display filter grids from a merged encoder.
+
+    ``display`` is a notebook builtin, so this is importable anywhere but only
+    callable inside IPython. Asking for it explicitly turns a confusing NameError
+    on the last line into a clear one before any work is done.
+    """
+    try:
+        from IPython.display import display
+    except ImportError as error:  # pragma: no cover - depends on the environment
+        raise RuntimeError(
+            "display_filter_grids renders inline and needs IPython; use "
+            "extract_filter_grids and save the tensors yourself outside a notebook"
+        ) from error
     grids = extract_filter_grids(merged, n_channels)
     images = []
     for label, grid in grids:

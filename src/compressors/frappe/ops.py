@@ -3,7 +3,6 @@ and nested multi-scale grid packing/unpacking."""
 
 import torch
 import torch.nn.functional as F
-from einops import rearrange
 
 
 def get_scale_groups(ps_list, n_ch):

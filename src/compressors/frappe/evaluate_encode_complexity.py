@@ -41,7 +41,6 @@ from . import entropy_coding as default_entropy_coding
 from .model import load_from_hub, load_progressive_model
 from .quantize import srgb_to_linear
 
-
 DEFAULT_REPO_ID = "danjacobellis/FRAPPE"
 DEFAULT_SUBDIR = "FRAPPE"
 WEIGHTS_FILENAME = "FRAPPE_pytorch_model.safetensors"
@@ -213,12 +212,11 @@ def _measure_one_n_ch(
         for x in inputs_on_device:
             x_in = srgb_to_linear(x) if getattr(config, "linear_input", False) else x
             if timed:
-                with wallclock("analysis"):
-                    with torch.inference_mode():
-                        latents = model.encode(x_in)
-                        latents_q = [
-                            z.round().clamp(-127, 127).to(torch.int8) for z in latents
-                        ]
+                with wallclock("analysis"), torch.inference_mode():
+                    latents = model.encode(x_in)
+                    latents_q = [
+                        z.round().clamp(-127, 127).to(torch.int8) for z in latents
+                    ]
                 with wallclock("transfer"):
                     latents_cpu = [z.cpu() for z in latents_q]
                 with wallclock("store"):
