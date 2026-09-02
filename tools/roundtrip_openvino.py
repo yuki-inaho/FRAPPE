@@ -72,8 +72,10 @@ RAW_BITS_PER_PIXEL = 24.0
 
 def as_torch_planes(planes) -> list[torch.Tensor]:
     """OpenVINO's ``(1, rows, cols)`` uint8 arrays as the harness's 2D tensors."""
-    return [torch.from_numpy(np.ascontiguousarray(plane[0] if plane.ndim == 3
-                                                  else plane)) for plane in planes]
+    return [
+        torch.from_numpy(np.ascontiguousarray(plane[0] if plane.ndim == 3 else plane))
+        for plane in planes
+    ]
 
 
 def rate_of(planes, pixels: int) -> dict:
@@ -87,8 +89,12 @@ def rate_of(planes, pixels: int) -> dict:
     tensors = as_torch_planes(planes)
     bare = len(encode_planes(tensors, BitstreamConvention.PAYLOAD_ONLY))
     prefixed = bare + BitstreamConvention.WITH_LENGTH_PREFIX.overhead_bytes(len(tensors))
-    return {"bytes": bare, "bytes_with_length_prefix": prefixed,
-            "bpp": bare * 8 / pixels, "bpp_with_length_prefix": prefixed * 8 / pixels}
+    return {
+        "bytes": bare,
+        "bytes_with_length_prefix": prefixed,
+        "bpp": bare * 8 / pixels,
+        "bpp_with_length_prefix": prefixed * 8 / pixels,
+    }
 
 
 def reference_planes(checkpoint: Path, image: torch.Tensor) -> list[torch.Tensor]:
@@ -120,35 +126,55 @@ def resolve(requested: str, prefer, core) -> tuple[str, list]:
         choice = select_device(prefer, core)
     else:
         choice = select_device([requested], core)
-    return choice.device, [{"device": device, "reason": reason}
-                           for device, reason in choice.considered]
+    return choice.device, [
+        {"device": device, "reason": reason} for device, reason in choice.considered
+    ]
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description=__doc__,
-                                     formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--onnx-stem", type=Path, required=True,
-                        help="path stem of the exported pair, without _encoder.onnx")
+    parser = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
+    )
+    parser.add_argument(
+        "--onnx-stem",
+        type=Path,
+        required=True,
+        help="path stem of the exported pair, without _encoder.onnx",
+    )
     parser.add_argument("--dataset-root", type=Path, default=default_dataset_root())
     parser.add_argument("--split", default="validation")
-    parser.add_argument("--index", type=int, default=0,
-                        help="first image index in the split; the report records this, "
-                             "never a filename")
+    parser.add_argument(
+        "--index",
+        type=int,
+        default=0,
+        help="first image index in the split; the report records this, never a filename",
+    )
     parser.add_argument("--images", type=int, default=1)
-    parser.add_argument("--encoder-device", default="CPU",
-                        help="a concrete OpenVINO device, or 'prefer' to use --prefer")
-    parser.add_argument("--decoder-device", default="CPU",
-                        help="a concrete OpenVINO device, or 'prefer' to use --prefer")
+    parser.add_argument(
+        "--encoder-device",
+        default="CPU",
+        help="a concrete OpenVINO device, or 'prefer' to use --prefer",
+    )
+    parser.add_argument(
+        "--decoder-device",
+        default="CPU",
+        help="a concrete OpenVINO device, or 'prefer' to use --prefer",
+    )
     parser.add_argument("--prefer", nargs="+", default=None)
-    parser.add_argument("--bit-exact", action=argparse.BooleanOptionalAction, default=False,
-                        help="ask the encoder device for the settings that reproduce the "
-                             "reference codes; fails on a device that cannot")
+    parser.add_argument(
+        "--bit-exact",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="ask the encoder device for the settings that reproduce the "
+        "reference codes; fails on a device that cannot",
+    )
     parser.add_argument("--cache-dir", type=Path, default=None)
     parser.add_argument("--warmup", type=int, default=2)
     parser.add_argument("--repeats", type=int, default=5)
     parser.add_argument("--reference-checkpoint", type=Path, default=None)
-    parser.add_argument("--output", type=Path, default=None,
-                        help="write the reconstruction of the first image here")
+    parser.add_argument(
+        "--output", type=Path, default=None, help="write the reconstruction of the first image here"
+    )
     parser.add_argument("--report", type=Path, default=None)
     return parser
 
@@ -169,20 +195,25 @@ def main(argv=None) -> None:
     folder = AnonymousImageFolder(args.dataset_root, args.split)
     indices = [args.index + offset for offset in range(args.images)]
     if indices[-1] >= len(folder):
-        raise SystemExit(f"{args.split!r} has {len(folder)} images; "
-                         f"indices {indices[0]}..{indices[-1]} do not fit")
+        raise SystemExit(
+            f"{args.split!r} has {len(folder)} images; "
+            f"indices {indices[0]}..{indices[-1]} do not fit"
+        )
 
     first = folder.pixels(indices[0])
     _batch, channels, height, width = first.shape
     pixels = height * width
     started_all = time.perf_counter()
-    encoder = FrappeEncoder(args.onnx_stem, encoder_device, height, width,
-                            core=core, properties=encoder_properties)
+    encoder = FrappeEncoder(
+        args.onnx_stem, encoder_device, height, width, core=core, properties=encoder_properties
+    )
     decoder = FrappeDecoder(args.onnx_stem, decoder_device, encoder.plane_shapes, core=core)
     compile_seconds = time.perf_counter() - started_all
     print(f"pinned to {width}x{height}")
-    print(f"  encoder {encoder.device} -> ran on {encoder.execution_devices}"
-          f"{'  [bit-exact settings]' if args.bit_exact else ''}")
+    print(
+        f"  encoder {encoder.device} -> ran on {encoder.execution_devices}"
+        f"{'  [bit-exact settings]' if args.bit_exact else ''}"
+    )
     print(f"  decoder {decoder.device} -> ran on {decoder.execution_devices}")
     print(f"  planes  {list(zip(encoder.plane_names, encoder.plane_shapes))}")
 
@@ -192,53 +223,66 @@ def main(argv=None) -> None:
     for index in indices:
         image = first if index == indices[0] else folder.pixels(index)
         array = image.numpy()
-        planes, encode_median = timed(lambda a=array: encoder(a),
-                                      args.warmup, args.repeats)
+        planes, encode_median = timed(lambda a=array: encoder(a), args.warmup, args.repeats)
 
         if args.reference_checkpoint:
             reference = reference_planes(args.reference_checkpoint, image)
             candidate = as_torch_planes(planes)
-            mismatched = sum(int((want != got).sum())
-                             for want, got in zip(reference, candidate))
+            mismatched = sum(int((want != got).sum()) for want, got in zip(reference, candidate))
             mismatched_total += mismatched
             if mismatched:
-                worst = max(int((want.to(torch.int32) - got.to(torch.int32)).abs().max())
-                            for want, got in zip(reference, candidate))
+                worst = max(
+                    int((want.to(torch.int32) - got.to(torch.int32)).abs().max())
+                    for want, got in zip(reference, candidate)
+                )
                 raise SystemExit(
                     f"the {encoder.device} encoder does not reproduce the reference "
                     f"bitstream: {mismatched} symbols differ, max |difference| {worst}. "
                     "Encode on a device that advertises FP32, or drop --reference-checkpoint "
-                    "and accept the measured inexactness.")
+                    "and accept the measured inexactness."
+                )
 
         tensors = as_torch_planes(planes)
         blob, jpegls_median = timed(
             lambda t=tensors: encode_planes(t, BitstreamConvention.WITH_LENGTH_PREFIX),
-            0, max(1, args.repeats // 2))
+            0,
+            max(1, args.repeats // 2),
+        )
         restored = decode_planes(blob)
         for want, got in zip(tensors, restored):
             if not torch.equal(want, got):
-                raise SystemExit("JPEG-LS did not round-trip the planes; at NEAR=0 it "
-                                 "is lossless, so this is a defect and not a tolerance")
+                raise SystemExit(
+                    "JPEG-LS did not round-trip the planes; at NEAR=0 it "
+                    "is lossless, so this is a defect and not a tolerance"
+                )
 
         reconstruction, decode_median = timed(
-            lambda r=restored: decoder([plane.numpy() for plane in r]),
-            args.warmup, args.repeats)
+            lambda r=restored: decoder([plane.numpy() for plane in r]), args.warmup, args.repeats
+        )
         rate = rate_of(planes, pixels)
-        difference = (image.to(torch.float64) - torch.from_numpy(reconstruction)
-                      .to(torch.float64)) / 255.0
-        pooled_error += float((difference ** 2).sum())
+        difference = (
+            image.to(torch.float64) - torch.from_numpy(reconstruction).to(torch.float64)
+        ) / 255.0
+        pooled_error += float((difference**2).sum())
         pooled_samples += difference.numel()
         pooled_bytes += rate["bytes"]
         pooled_prefixed += rate["bytes_with_length_prefix"]
         encode_ms.append(encode_median)
         jpegls_ms.append(jpegls_median)
         decode_ms.append(decode_median)
-        rows.append({"index": index,
-                     "psnr_db": psnr_from_mse(float((difference ** 2).mean())),
-                     **rate,
-                     "compression_ratio": RAW_BITS_PER_PIXEL / rate["bpp"],
-                     "latency_ms": {"encode": encode_median, "jpegls": jpegls_median,
-                                    "decode": decode_median}})
+        rows.append(
+            {
+                "index": index,
+                "psnr_db": psnr_from_mse(float((difference**2).mean())),
+                **rate,
+                "compression_ratio": RAW_BITS_PER_PIXEL / rate["bpp"],
+                "latency_ms": {
+                    "encode": encode_median,
+                    "jpegls": jpegls_median,
+                    "decode": decode_median,
+                },
+            }
+        )
         if index == indices[0] and args.output:
             from PIL import Image
 
@@ -249,55 +293,96 @@ def main(argv=None) -> None:
     pooled_pixels = pixels * len(indices)
     bpp = pooled_bytes * 8 / pooled_pixels
     bpp_prefixed = pooled_prefixed * 8 / pooled_pixels
-    latency = {"encode_median": statistics.median(encode_ms),
-               "jpegls_median": statistics.median(jpegls_ms),
-               "decode_median": statistics.median(decode_ms),
-               "compile_seconds": compile_seconds,
-               "n_warmup": args.warmup, "n_measurement": args.repeats}
-    latency["total_median"] = (latency["encode_median"] + latency["jpegls_median"]
-                               + latency["decode_median"])
+    latency = {
+        "encode_median": statistics.median(encode_ms),
+        "jpegls_median": statistics.median(jpegls_ms),
+        "decode_median": statistics.median(decode_ms),
+        "compile_seconds": compile_seconds,
+        "n_warmup": args.warmup,
+        "n_measurement": args.repeats,
+    }
+    latency["total_median"] = (
+        latency["encode_median"] + latency["jpegls_median"] + latency["decode_median"]
+    )
 
-    table = Table(["stage", "device", "ms", "Mpixel/s"])
-    for label, device, value in (("encode", encoder.device, latency["encode_median"]),
-                                 ("JPEG-LS", "CPU", latency["jpegls_median"]),
-                                 ("decode", decoder.device, latency["decode_median"]),
-                                 ("total", "-", latency["total_median"])):
-        table.add(label, device, f"{value:.2f}", f"{pixels / value / 1000:.1f}")
+    stages = [
+        {
+            "stage": label,
+            "device": device,
+            "ms": f"{value:.2f}",
+            "Mpixel/s": f"{pixels / value / 1000:.1f}",
+        }
+        for label, device, value in (
+            ("encode", encoder.device, latency["encode_median"]),
+            ("JPEG-LS", "CPU", latency["jpegls_median"]),
+            ("decode", decoder.device, latency["decode_median"]),
+            ("total", "-", latency["total_median"]),
+        )
+    ]
     print()
-    table.render()
+    print(
+        Table(
+            [
+                ("stage", "stage", ""),
+                ("device", "device", ""),
+                ("ms", "ms", ">8"),
+                ("Mpixel/s", "Mpixel/s", ">9"),
+            ]
+        ).render(stages)
+    )
     psnr = psnr_from_mse(pooled_error / pooled_samples)
-    print(f"\n  {len(indices)} image(s)   PSNR {psnr:.3f} dB"
-          f"   {bpp:.5f} bpp   CR {RAW_BITS_PER_PIXEL / bpp:.3f}   [payload only]")
-    print(f"{'':22s}{bpp_prefixed:.5f} bpp   CR {RAW_BITS_PER_PIXEL / bpp_prefixed:.3f}"
-          "   [length prefixes included]")
+    print(
+        f"\n  {len(indices)} image(s)   PSNR {psnr:.3f} dB"
+        f"   {bpp:.5f} bpp   CR {RAW_BITS_PER_PIXEL / bpp:.3f}   [payload only]"
+    )
+    print(
+        f"{'':22s}{bpp_prefixed:.5f} bpp   CR {RAW_BITS_PER_PIXEL / bpp_prefixed:.3f}"
+        "   [length prefixes included]"
+    )
 
-    write_report({
-        "onnx_stem": str(args.onnx_stem),
-        "split": args.split, "indices": indices, "images": len(indices),
-        "static_shape": [width, height], "channels": channels,
-        "encoder": {"device": encoder.device, "properties": encoder_properties,
-                    "execution_devices": encoder.execution_devices,
-                    "skipped": encoder_skipped},
-        "decoder": {"device": decoder.device,
-                    "execution_devices": decoder.execution_devices,
-                    "skipped": decoder_skipped},
-        "rate_convention": "payload_only",
-        "psnr_db": psnr,
-        "psnr_mean_of_images_db": float(np.mean([row["psnr_db"] for row in rows])),
-        "bpp": bpp, "bpp_with_length_prefix": bpp_prefixed,
-        "compression_ratio": RAW_BITS_PER_PIXEL / bpp,
-        "compression_ratio_with_length_prefix": RAW_BITS_PER_PIXEL / bpp_prefixed,
-        "bytes": pooled_bytes,
-        "verification": {
-            "jpegls_roundtrip_exact": True,
-            "reference_checkpoint": (str(args.reference_checkpoint)
-                                     if args.reference_checkpoint else None),
-            "plane_mismatched_symbols": (mismatched_total if args.reference_checkpoint
-                                         else None),
+    write_report(
+        {
+            "onnx_stem": str(args.onnx_stem),
+            "split": args.split,
+            "indices": indices,
+            "images": len(indices),
+            "static_shape": [width, height],
+            "channels": channels,
+            "encoder": {
+                "device": encoder.device,
+                "properties": encoder_properties,
+                "execution_devices": encoder.execution_devices,
+                "skipped": encoder_skipped,
+            },
+            "decoder": {
+                "device": decoder.device,
+                "execution_devices": decoder.execution_devices,
+                "skipped": decoder_skipped,
+            },
+            "rate_convention": "payload_only",
+            "psnr_db": psnr,
+            "psnr_mean_of_images_db": float(np.mean([row["psnr_db"] for row in rows])),
+            "bpp": bpp,
+            "bpp_with_length_prefix": bpp_prefixed,
+            "compression_ratio": RAW_BITS_PER_PIXEL / bpp,
+            "compression_ratio_with_length_prefix": RAW_BITS_PER_PIXEL / bpp_prefixed,
+            "bytes": pooled_bytes,
+            "verification": {
+                "jpegls_roundtrip_exact": True,
+                "reference_checkpoint": (
+                    str(args.reference_checkpoint) if args.reference_checkpoint else None
+                ),
+                "plane_mismatched_symbols": (
+                    mismatched_total if args.reference_checkpoint else None
+                ),
+            },
+            "latency_ms": latency,
+            "per_image": rows,
+            "testbed": testbed(core),
+            "seconds": time.perf_counter() - started_all,
         },
-        "latency_ms": latency, "per_image": rows,
-        "testbed": testbed(core), "seconds": time.perf_counter() - started_all,
-    }, args.report)
+        args.report,
+    )
 
 
 if __name__ == "__main__":
