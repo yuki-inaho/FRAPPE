@@ -7,3 +7,5 @@ outputs/
 runs/
 .private/
 index.md
+.venv/
+temp/session_extracts/

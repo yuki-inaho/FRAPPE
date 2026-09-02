@@ -69,82 +69,13 @@ from src.compressors.frappe.harness.bitstream import (
 )
 from src.compressors.frappe.harness.checkpoints import load_checkpoint
 from src.compressors.frappe.harness.data import default_dataset_root
-
-
-class EncoderGraph(torch.nn.Module):
-    """Image in, JPEG-LS-ready grayscale planes out."""
-
-    def __init__(self, model, uint8_io: bool) -> None:
-        super().__init__()
-        self.analysis = model.analysis
-        self.companders = model.companders
-        self.uint8_io = uint8_io
-
-    def forward(self, image: torch.Tensor):
-        x = image.to(torch.float32) / 127.5 - 1.0 if self.uint8_io else image
-        planes = []
-        for analysis, compander in zip(self.analysis, self.companders):
-            codes = torch.clamp(torch.round(compander.companded(analysis(x))),
-                                -CODE_OFFSET, CODE_OFFSET)
-            # (N, C, h, w) -> (N, C*h, w). flatten of two adjacent axes stays
-            # shape-agnostic under export, where an explicit reshape target would
-            # bake in the traced spatial size.
-            plane = torch.flatten(codes, 1, 2)
-            planes.append((plane + CODE_OFFSET).to(torch.uint8) if self.uint8_io
-                          else plane.to(torch.int8))
-        return tuple(planes)
-
-
-class DecoderGraph(torch.nn.Module):
-    """Grayscale planes in, reconstruction out, at one fixed operating point.
-
-    A deployed decoder serves one prefix, so freezing it lets the channel mask
-    fold into the first convolution instead of surviving as a runtime multiply.
-    """
-
-    def __init__(self, model, prefix: int, uint8_io: bool) -> None:
-        super().__init__()
-        self.model = model
-        self.prefix = prefix
-        self.uint8_io = uint8_io
-        self.widths = [end - start for _, start, end in model.scale_groups]
-
-    def forward(self, *planes: torch.Tensor):
-        latents = []
-        for plane, width in zip(planes, self.widths):
-            value = plane.to(torch.float32)
-            if self.uint8_io:
-                value = value - CODE_OFFSET
-            latents.append(value.unflatten(1, (width, -1)))  # (N, C*h, w) -> (N, C, h, w)
-        reconstruction = self.model.decode(self.model.adapt(latents), self.prefix)
-        if self.uint8_io:
-            return torch.clamp(
-                torch.round((reconstruction.clamp(-1.0, 1.0) / 2 + 0.5) * 255.0),
-                0.0, 255.0).to(torch.uint8)
-        return reconstruction
-
-
-def dynamic_shapes(model, max_units: int = 4096):
-    """Affine shape relations the exporter needs to keep ``H`` and ``W`` symbolic.
-
-    Sizes are expressed in units of the largest patch size, which is the only
-    granularity the non-overlapping analysis admits. Each scale group's plane is
-    then ``rows = n_s * (max_ps / p_s) * units_h`` by
-    ``cols = (max_ps / p_s) * units_w``. The lower bound of two is not cosmetic:
-    the first decoder convolution pads by reflection, which is undefined once the
-    grid is a single element, and the exporter refuses to emit a graph whose
-    guards it cannot satisfy.
-    """
-    from torch.export import Dim
-
-    max_ps = max(model.ps)
-    units_h = Dim("units_h", min=2, max=max_units)
-    units_w = Dim("units_w", min=2, max=max_units)
-    image = {2: max_ps * units_h, 3: max_ps * units_w}
-    planes = tuple({1: (end - start) * (max_ps // ps) * units_h,
-                    2: (max_ps // ps) * units_w}
-                   for ps, start, end in model.scale_groups)
-    return image, planes
+from src.compressors.frappe.harness.deployment import (
+    DecoderGraph,
+    EncoderGraph,
+    describe,
+    dynamic_shapes,
+    plane_names,
+)
 
 
 def export(module: torch.nn.Module, sample: tuple, path: Path, input_names: list[str],
@@ -180,29 +111,6 @@ def session(path: Path, threads: int):
     options.graph_optimization_level = onnxruntime.GraphOptimizationLevel.ORT_ENABLE_ALL
     return onnxruntime.InferenceSession(str(path), options,
                                         providers=["CPUExecutionProvider"])
-
-
-def describe(path: Path) -> dict:
-    """The graph's declared input and output signature, as deployed code sees it."""
-    import onnx
-
-    model = onnx.load(str(path))
-
-    def signature(values):
-        described = []
-        for value in values:
-            tensor = value.type.tensor_type
-            dims = [d.dim_param or d.dim_value for d in tensor.shape.dim]
-            described.append({"name": value.name,
-                              "dtype": onnx.TensorProto.DataType.Name(tensor.elem_type),
-                              "shape": dims})
-        return described
-
-    initialisers = {i.name for i in model.graph.initializer}
-    return {"inputs": signature([v for v in model.graph.input
-                                 if v.name not in initialisers]),
-            "outputs": signature(model.graph.output),
-            "opset": model.opset_import[0].version}
 
 
 def verify_against_reference(model, decoder, folder, encoder_session, decoder_session,
@@ -348,7 +256,7 @@ def main() -> None:
     if args.export_height % max_ps or args.export_width % max_ps:
         raise SystemExit(f"export size must be a multiple of the largest patch size {max_ps}")
 
-    plane_names = [f"plane_p{ps}" for ps, _, _ in model.scale_groups]
+    names = plane_names(model)
     image_shape, plane_shapes = dynamic_shapes(model)
     encoder = EncoderGraph(model, uint8_io).eval()
     decoder = DecoderGraph(model, prefix, uint8_io).eval()
@@ -361,9 +269,9 @@ def main() -> None:
 
     encoder_path = args.output_stem.with_name(args.output_stem.name + "_encoder.onnx")
     decoder_path = args.output_stem.with_name(args.output_stem.name + "_decoder.onnx")
-    encoder_info = export(encoder, (sample_image,), encoder_path, ["image"], plane_names,
+    encoder_info = export(encoder, (sample_image,), encoder_path, ["image"], names,
                           (image_shape,), args.opset, args.simplify)
-    decoder_info = export(decoder, sample_planes, decoder_path, plane_names,
+    decoder_info = export(decoder, sample_planes, decoder_path, names,
                           ["reconstruction"], (plane_shapes,), args.opset, args.simplify)
 
     for path, info in ((encoder_path, encoder_info), (decoder_path, decoder_info)):
@@ -382,11 +290,11 @@ def main() -> None:
     folder = AnonymousImageFolder(args.dataset_root, args.split)
     verification = verify_against_reference(
         model, decoder, folder, encoder_session, decoder_session,
-        plane_names, args.verify_images, uint8_io)
-    resolutions = verify_resolutions(model, encoder_session, decoder_session, plane_names,
+        names, args.verify_images, uint8_io)
+    resolutions = verify_resolutions(model, encoder_session, decoder_session, names,
                                      uint8_io, args.export_height, args.export_width)
     encode_ms, decode_ms = measure_latency(
-        encoder_session, decoder_session, plane_names,
+        encoder_session, decoder_session, names,
         folder.pixels(0) if uint8_io else folder.signed(0), args.timing_repeats)
     pixels = args.export_height * args.export_width
     print(f"\n  CPU latency at {args.export_width}x{args.export_height}, "

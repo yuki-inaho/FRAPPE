@@ -1,6 +1,70 @@
-# Tool configuration only. The environment itself is defined in pixi.toml; this
-# file exists so ruff, pytest and ty read one consistent set of rules rather
-# than each tool's defaults.
+# Tool configuration, plus the uv-managed deployment environment.
+#
+# Research and training live in pixi.toml: that environment is pinned around a
+# CUDA PyTorch build and is not something a deployment box needs. The work of
+# turning a trained checkpoint into something an Intel NPU runs -- quantization,
+# OpenVINO conversion, accuracy verification -- is a separate concern with a
+# separate dependency set, so it gets a separate, lockable environment here
+# rather than being bolted onto the training one.
+#
+#   uv sync --group deploy    # quantization + OpenVINO, CUDA torch for QAT
+#   uv sync --group inc       # Intel Neural Compressor, evaluated separately
+#
+# ruff, pytest and ty read their rules from the same file either way, so the
+# two environments cannot drift on style or test configuration.
+
+[project]
+name = "frappe"
+version = "0.1.0"
+description = "FRAPPE: Full-Input Residual-Output Autoencoding with Projection Pursuit Encoders"
+requires-python = "==3.12.*"
+
+[tool.uv]
+# The repository is run from a checkout, not installed; PYTHONPATH=. is how both
+# environments already reach `src` and `tools`.
+package = false
+
+[[tool.uv.index]]
+name = "pytorch-cu128"
+url = "https://download.pytorch.org/whl/cu128"
+explicit = true
+
+[tool.uv.sources]
+torch = { index = "pytorch-cu128" }
+torchvision = { index = "pytorch-cu128" }
+
+[dependency-groups]
+# Everything needed to quantize an encoder and prove the result still codes the
+# same bitstream: NNCF for the quantizers, OpenVINO for the target runtime,
+# onnxruntime for the reference graph, pillow-jpls for the real entropy coder,
+# and CUDA torch because quantization-aware fine-tuning is a training loop.
+deploy = [
+    "torch>=2.7.0",
+    "torchvision>=0.22.0",
+    "numpy",
+    "pillow",
+    "pillow-jpls",
+    "openvino",
+    "nncf",
+    "onnx",
+    "onnxruntime",
+    "onnxsim",
+    "onnxscript",
+    "beartype",
+    "jaxtyping",
+    "pytest",
+    # The QAT loop records its own runs the same way the training one does.
+    "tensorboard",
+    # The codec package itself: model.py reaches for these at import time, and a
+    # quantizer that cannot construct the model has nothing to quantize.
+    "einops",
+    "livecodec",
+    "timm",
+]
+# Intel Neural Compressor is kept in its own group: it carries a transformers
+# and accelerate dependency chain that has nothing to do with an image codec,
+# and its PyTorch QAT covers a different scheme space than this model needs.
+inc = ["neural-compressor"]
 
 [tool.ruff]
 line-length = 100

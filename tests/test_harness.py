@@ -180,10 +180,11 @@ def test_every_jpegls_writer_imports_the_plugin():
     root = Path(__file__).resolve().parents[1]
     offenders = []
     for path in sorted(root.glob("**/*.py")):
-        if ".pixi" in path.parts or path.name == Path(__file__).name:
+        if ".pixi" in path.parts or ".venv" in path.parts \
+                or path.name == Path(__file__).name:
             continue
         source = path.read_text(encoding="utf-8")
-        if 'format="JPEG-LS"' in source or "format='JPEG-LS'" in source:
-            if "pillow_jpls" not in source:
-                offenders.append(path.relative_to(root).as_posix())
+        writes_jpegls = 'format="JPEG-LS"' in source or "format='JPEG-LS'" in source
+        if writes_jpegls and "pillow_jpls" not in source:
+            offenders.append(path.relative_to(root).as_posix())
     assert not offenders, f"writes JPEG-LS without importing pillow_jpls: {offenders}"

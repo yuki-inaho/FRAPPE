@@ -64,7 +64,8 @@ def test_the_dataset_root_has_one_definition() -> None:
     holders = sorted(
         path.relative_to(REPOSITORY_ROOT).as_posix()
         for path in REPOSITORY_ROOT.glob("**/*.py")
-        if ".pixi" not in path.parts and literal in path.read_text(encoding="utf-8"))
+        if ".pixi" not in path.parts and ".venv" not in path.parts
+        and literal in path.read_text(encoding="utf-8"))
     allowed = {"src/compressors/frappe/harness/data.py",
                "tests/test_tools_cli.py", "tests/test_managed_config.py"}
     assert set(holders) <= allowed, sorted(set(holders) - allowed)
