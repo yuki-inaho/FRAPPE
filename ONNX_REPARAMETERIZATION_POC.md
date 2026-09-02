@@ -45,6 +45,45 @@ guards, weight mapping, and backend validation implemented here. Relevant
 operator contracts are [DepthToSpace](https://onnx.ai/onnx/operators/onnx__DepthToSpace.html)
 and [Gelu](https://onnx.ai/onnx/operators/onnx__Gelu.html).
 
+## Relation to prior work
+
+The decoder rewrite in this PoC is not a new general identity. It is the
+smallest, deployment-useful member of a well-established family usually called
+polyphase decomposition, split deconvolution, sub-convolution, or periodic
+shuffle.
+
+| Prior work or implementation | Representation | What it establishes for this PoC |
+|---|---|---|
+| [Shi et al. (2016)](https://arxiv.org/abs/1609.07009) | transposed convolution, sub-pixel convolution, and low-resolution convolution with periodic shuffle | theoretical relationship; it does not say every Deconv becomes a 1x1 Conv |
+| [Split Deconvolution, Xu et al. (2019)](https://arxiv.org/abs/1907.01773) | `r^2` phase Convs plus output reorganization | direct generalization: zero-extend, phase-sample, rotate, convolve, and reorder |
+| [NVDLA programming guide](https://nvdla.org/hw/v1/ias/programming_guide.html#deconvolution) | `stride_x * stride_y` hardware Convs plus RUBIK contract/reorder | a production compiler/hardware precedent for the same decomposition |
+| [XNNPACK deconvolution implementation](https://github.com/google/XNNPACK/blob/master/src/operators/deconvolution-nhwc.c) | packed internal `subconv2d` kernels written into output phases | a production runtime can use polyphase execution without exposing `DepthToSpace` in its graph |
+| [QONNX `SubPixelToDeconvolution`](https://github.com/fastmachinelearning/qonnx/blob/main/src/qonnx/transformation/subpixel_to_deconv.py) | `Conv + DepthToSpace -> ConvTranspose` | a tested ONNX rewrite in the reverse direction, with explicit restrictions |
+
+The Split Deconvolution paper gives the important general construction. For
+stride `r`, it zero-extends a kernel when needed, forms `r^2` sampled and
+spatially rotated phase filters, pads the input for boundary values, runs
+stride-one Convs, and interleaves the results. Its largest phase kernel is
+
+```text
+ceil(kernel_h / stride_h) x ceil(kernel_w / stride_w).
+```
+
+NVDLA independently documents the same shape and split count, then uses its
+RUBIK unit for the reordering. XNNPACK goes one level lower: it packs
+`stride_h * stride_w` subkernels and calculates each phase kernel with a
+round-up division. Neither example implies that an ONNX frontend should always
+materialize one `Conv + DepthToSpace`; backend-native phase writes may be
+better.
+
+QONNX is useful as an implementation-quality reference even though its main
+transformation is reversed. Its current code requires two-dimensional NCHW,
+square same-padded Conv, group one, dilation one, and no bias; it has preliminary
+support for per-tensor QONNX-quantized weights. Its tests compare floating-point
+and quantized ESPCN graphs before and after transformation. These restrictions
+support this PoC's policy: a short, explicit support matrix plus refusal is
+safer than claiming general ONNX coverage.
+
 ## Proven transformations
 
 ### 1. Input normalization absorption
@@ -117,6 +156,36 @@ claim that an arbitrary `ConvTranspose(k=4, stride=2, padding=1)` is equivalent
 to a 1x1 Conv. Overlapping kernels, padding, output padding, dilation, groups,
 and explicit output shapes are refused.
 
+In the general square, isotropic case, a useful mental model is:
+
+```text
+ConvTranspose(kernel=K, stride=r)
+  -> Conv(kernel=ceil(K/r), outputs=C_out*r*r)
+  -> phase reorder
+  -> boundary Slice/Pad when required
+```
+
+Thus `K=4, r=2` needs 2x2 phase kernels, not 1x1. If all phases cannot share
+one padding and output shape, they must remain separate Convs or gain
+phase-specific Pad/Slice operations. Asymmetric stride cannot use ONNX
+`DepthToSpace` directly because that operator has one square block size; a
+`Reshape -> Transpose -> Reshape` reorder is then required. `output_padding`,
+explicit `output_shape`, groups, dilation, dynamic weights, and DCR/CRD ordering
+each need their own proof and tests.
+
+This PoC deliberately does not implement that generalization. A future pass
+must use an ONNX-attribute test matrix, not just tensor-shape agreement:
+
+1. kernels divisible and non-divisible by stride, including `4/2`, `3/2`, and
+   the existing `8/8` case;
+2. symmetric and asymmetric four-sided padding;
+3. every legal `output_padding` and explicit-output-shape interaction;
+4. grouped and depthwise-like channel layouts;
+5. unequal horizontal and vertical strides;
+6. constant, Q/DQ, FakeQuantize, and dynamic weight producers;
+7. float64 algebraic reference, ONNX Runtime, and OpenVINO target-device
+   comparisons at interior and boundary pixels.
+
 The preceding 1x1 Conv is deliberately not merged with the phase Conv in this
 PoC. Such a merge is algebraically possible, but increases rounding drift and
 couples an independently testable transformation to the decoder head rewrite.
@@ -142,6 +211,56 @@ values in the eight-image probe. OpenVINO CPU was bit-exact because it already
 recognizes both graph forms. The indicative OpenVINO median was 23.77 ms for
 the expanded graph and 24.33 ms for the canonical graph, i.e. no demonstrated
 speed benefit.
+
+## Quantization-specific reparameterization: ICAS candidate
+
+The polyphase graph rewrite changes the operator representation. A separate and
+potentially complementary technique is to keep `ConvTranspose` but rebalance
+its input channels before quantization. [ESCA's Input Channel-wise Activation
+Smoothing](https://papers.nips.cc/paper_files/paper/2025/file/82844e428d9163a9f94830dc03af4f9c-Paper-Conference.pdf)
+uses positive per-input-channel factors `s[c]`:
+
+```text
+X'[c] = s[c] * X[c]
+W_deconv'[c, out, kh, kw] = W_deconv[c, out, kh, kw] / s[c]
+```
+
+The floating-point layer function is unchanged over real arithmetic, while the
+activation range can become easier to quantize. ESCA estimates
+
+```text
+s[c] = max_abs_activation[c] ** alpha
+       / max_abs_weight[c] ** (1 - alpha)
+```
+
+from calibration data and sweeps `alpha`; the paper reports selecting 0.8 for
+its model. That value is not transferable evidence for FRAPPE.
+
+FRAPPE has an especially clean place to test this idea: the released decoder's
+final `Conv` feeds `ConvTranspose` directly. Therefore the explicit input scale
+can be removed at deployment by multiplying the preceding Conv's output-channel
+weights and bias by `s`, while dividing the matching ConvTranspose input-channel
+weights by `s`. No nonlinear operation lies on that edge.
+
+This absorption must not be generalized across the trunk's GELUs. ESCA moves
+scales through LeakyReLU using positive homogeneity, but GELU does not satisfy
+`GELU(s*x) == s*GELU(x)`. For FRAPPE the initial experiment should be limited to
+the direct final-Conv-to-Deconv edge:
+
+1. collect per-channel activation maxima on a calibration split;
+2. sweep `alpha`, including zero and one, and clamp extreme scales;
+3. apply the paired preceding-Conv/Deconv weight transformation in FP32;
+4. verify the unquantized graph separately to measure floating-point drift;
+5. run the same NNCF calibration/QAT schedule for every candidate;
+6. choose with quantized holdout PSNR, JPEG-LS bpp where applicable, saturation,
+   and target-device latency—not activation MSE alone;
+7. compare native Deconv and the phase-Conv representation, because the better
+   scale placement can depend on backend quantizer granularity.
+
+ICAS is therefore a strong follow-up for the quantization work, but it should
+not be silently bundled into `--replace-nonoverlap-convtranspose`. Graph
+lowering and quantization-range balancing answer different questions and need
+separate ablations.
 
 ## Rate-distortion probe
 

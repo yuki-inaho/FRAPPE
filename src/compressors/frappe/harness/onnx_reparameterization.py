@@ -425,7 +425,15 @@ def replace_nonoverlap_convtranspose(source: Any, *, strict: bool = True) -> Rew
             kernel = tuple(attrs.get("kernel_shape", weight.shape[2:]))
             strides = tuple(attrs.get("strides", (1, 1)))
             if kernel[0] != kernel[1] or strides != kernel:
-                reasons.append(f"kernel {kernel} must be square and equal strides {strides}")
+                phase_kernel = tuple(
+                    (size + stride - 1) // stride
+                    for size, stride in zip(kernel, strides, strict=True)
+                )
+                reasons.append(
+                    f"current pass requires square kernel == stride, got kernel {kernel} "
+                    f"and strides {strides}; a general polyphase rewrite would need "
+                    f"phase kernels up to {phase_kernel} plus boundary handling"
+                )
         if tuple(attrs.get("pads", (0, 0, 0, 0))) != (0, 0, 0, 0):
             reasons.append("padding must be zero")
         if tuple(attrs.get("output_padding", (0, 0))) != (0, 0):

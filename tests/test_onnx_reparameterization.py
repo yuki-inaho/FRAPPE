@@ -208,7 +208,7 @@ def test_nonoverlap_deconv_becomes_phase_conv_and_depth_to_space():
 
 
 def test_overlapping_deconv_is_refused():
-    with pytest.raises(RewriteError, match="must be square and equal strides"):
+    with pytest.raises(RewriteError, match="phase kernels up to \\(2, 2\\)"):
         replace_nonoverlap_convtranspose(deconv_fixture(kernel=4, stride=2))
 
 
