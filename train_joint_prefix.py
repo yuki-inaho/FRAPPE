@@ -378,32 +378,43 @@ def validation_checkpoint(model, ema, optimizer, validation, report_prefixes,
     return report, lam_rate, best
 
 
-def main(argv=None) -> None:
-    args = parse_args(argv)
-    started = time.time()
-    random.seed(args.seed)
-    np.random.seed(args.seed)
-    torch.manual_seed(args.seed)
-    torch.backends.cudnn.benchmark = True
-    device = args.device if torch.cuda.is_available() else "cpu"
-    max_ps = max(args.ps)
-    if args.crop % max_ps:
-        raise SystemExit(f"--crop must be a multiple of the largest patch size {max_ps}")
+@dataclass
+class TrainingContext:
+    """Everything the loop needs, assembled once.
 
-    run_dir = args.run_dir.resolve()
-    run_dir.mkdir(parents=True, exist_ok=True)
-    tracker = TensorBoardTracker(run_dir / "tensorboard", enabled=True)
-    kbest = KBestCheckpointManager(run_dir / "checkpoints" / "best", k=args.keep_best_k, mode="max")
+    The loop reads sixteen things and a function signature listing them is worse
+    than a name for the collection. Grouping them also makes the loop's
+    dependencies visible: it is not reaching into a module, it is given a run.
+    """
 
-    model = build_model(args, device)
+    model: JointPrefixFRAPPE
+    optimizer: torch.optim.Optimizer
+    ema: ModelEMA | None
+    loader: torch.utils.data.DataLoader
+    sampler: PrefixSampler
+    validation: torch.Tensor
+    args: argparse.Namespace
+    device: str
+    tracker: TensorBoardTracker
+    kbest: KBestCheckpointManager
+    run_dir: Path
+    analysis_params: list
+    base_lrs: list
+    report_prefixes: list
+    target_point: int
+    rate_target: RateTarget | None
+    started: float
 
-    validation = load_full_images(args.dataset_root, "validation", args.validation_images, device)
-    loader = build_loader(args)
-    analysis_params, optimizer = build_optimizer(model, args)
-    base_lrs = [group["lr"] for group in optimizer.param_groups]
-    ema = ModelEMA(model, args.ema_decay) if args.ema_decay > 0 else None
-    sampler = PrefixSampler(args.ps, args.extra_prefixes, args.seed)
 
+def resume_if_asked(model, optimizer, ema, tracker, args, device: str
+                    ) -> tuple[int, float]:
+    """Continue a run, or start one, and say which.
+
+    A --resume pointing at nothing used to start from scratch and then
+    overwrite last.pth.tar in the same directory, destroying the thing the
+    caller meant to continue. The multiplier travels with the checkpoint so
+    a resumed rate-targeted run does not restart its dual ascent.
+    """
     start_iteration = 0
     resumed_lam_rate = None
     if args.resume and not args.resume.is_file():
@@ -426,7 +437,15 @@ def main(argv=None) -> None:
             if state.get("lam_rate") is not None:
                 resumed_lam_rate = float(state["lam_rate"])
             print(f"resumed {args.resume} at iteration {start_iteration}", flush=True)
+    lam_rate = resumed_lam_rate if resumed_lam_rate is not None else float(args.lam_rate)
+    if args.target_bpp is not None and lam_rate <= 0:
+        # A starting point only; the dual ascent moves it within a few checks.
+        lam_rate = 0.05
+    return start_iteration, lam_rate
 
+
+def write_run_metadata(model, args, run_dir, device: str) -> None:
+    """Everything needed to reproduce this run, written before it starts."""
     atomic_json_dump({
         "schema_version": 1,
         "algorithm": "joint-prefix-QAT",
@@ -438,8 +457,8 @@ def main(argv=None) -> None:
                     "device": torch.cuda.get_device_name(0) if torch.cuda.is_available() else "cpu"},
     }, run_dir / "run_metadata.json")
 
-    report_prefixes = sorted({n for n in (1, 9, 15, 18, model.n_channels)
-                              if n <= model.n_channels})
+
+def announce(model, args) -> None:
     print(f"\n{'=' * 66}\n  Joint prefix QAT: {model.n_channels} channels, "
           f"{model.total_decoder_channels} decoder ch, "
           f"{sum(p.numel() for p in model.parameters()) / 1e6:.1f}M params\n"
@@ -447,16 +466,24 @@ def main(argv=None) -> None:
           f"amp={args.amp}\n  continuation boundaries={args.continuation} "
           f"target={args.target_psnr} dB\n{'=' * 66}\n", flush=True)
 
+
+def run_training(ctx: TrainingContext, start_iteration: int, lam_rate: float) -> BestSoFar:
+    """The optimisation loop: sample, step, and check in on a cadence.
+
+    Everything that decides *what* is optimised -- the quantization stage, the
+    operating points, the price of a bit -- is settled before the loop starts and
+    handed to it. What is left here is the mechanics.
+    """
+    model, args, device = ctx.model, ctx.args, ctx.device
+    optimizer, tracker, kbest = ctx.optimizer, ctx.tracker, ctx.kbest
+    ema, loader, sampler = ctx.ema, ctx.loader, ctx.sampler
+    validation, report_prefixes = ctx.validation, ctx.report_prefixes
+    analysis_params, base_lrs = ctx.analysis_params, ctx.base_lrs
+    rate_target, target_point = ctx.rate_target, ctx.target_point
+    run_dir, started = ctx.run_dir, ctx.started
     autocast = (torch.autocast("cuda", dtype=torch.bfloat16)
                 if args.amp == "bf16" and device.startswith("cuda")
                 else torch.autocast("cuda", enabled=False))
-    lam_rate = resumed_lam_rate if resumed_lam_rate is not None else float(args.lam_rate)
-    if args.target_bpp is not None and lam_rate <= 0:
-        lam_rate = 0.05  # a starting point; dual ascent moves it within a few checks
-    target_point = args.target_operating_point or model.n_channels
-    rate_target = (None if args.target_bpp is None
-                   else RateTarget(args.target_bpp, args.rate_dual_lr, args.lam_rate_max))
-
     model.train()
     iteration = start_iteration
     window: list[float] = []
@@ -535,6 +562,52 @@ def main(argv=None) -> None:
                 print(f"  reached the {args.target_psnr} dB target at iteration {iteration} "
                       f"after the full Q0-Q4 continuation", flush=True)
                 break
+    return best
+
+
+def main(argv=None) -> None:
+    args = parse_args(argv)
+    started = time.time()
+    random.seed(args.seed)
+    np.random.seed(args.seed)
+    torch.manual_seed(args.seed)
+    torch.backends.cudnn.benchmark = True
+    device = args.device if torch.cuda.is_available() else "cpu"
+    max_ps = max(args.ps)
+    if args.crop % max_ps:
+        raise SystemExit(f"--crop must be a multiple of the largest patch size {max_ps}")
+
+    run_dir = args.run_dir.resolve()
+    run_dir.mkdir(parents=True, exist_ok=True)
+    tracker = TensorBoardTracker(run_dir / "tensorboard", enabled=True)
+    kbest = KBestCheckpointManager(run_dir / "checkpoints" / "best", k=args.keep_best_k, mode="max")
+
+    model = build_model(args, device)
+
+    validation = load_full_images(args.dataset_root, "validation", args.validation_images, device)
+    loader = build_loader(args)
+    analysis_params, optimizer = build_optimizer(model, args)
+    ema = ModelEMA(model, args.ema_decay) if args.ema_decay > 0 else None
+    sampler = PrefixSampler(args.ps, args.extra_prefixes, args.seed)
+
+    start_iteration, lam_rate = resume_if_asked(
+        model, optimizer, ema, tracker, args, device)
+    write_run_metadata(model, args, run_dir, device)
+    report_prefixes = sorted({n for n in (1, 9, 15, 18, model.n_channels)
+                              if n <= model.n_channels})
+    announce(model, args)
+
+    context = TrainingContext(
+        model=model, optimizer=optimizer, ema=ema, loader=loader, sampler=sampler,
+        validation=validation, args=args, device=device, tracker=tracker, kbest=kbest,
+        run_dir=run_dir, analysis_params=analysis_params,
+        base_lrs=[group["lr"] for group in optimizer.param_groups],
+        report_prefixes=report_prefixes,
+        target_point=args.target_operating_point or model.n_channels,
+        rate_target=(None if args.target_bpp is None
+                     else RateTarget(args.target_bpp, args.rate_dual_lr, args.lam_rate_max)),
+        started=started)
+    best = run_training(context, start_iteration, lam_rate)
 
     tracker.close()
     total = time.time() - started
