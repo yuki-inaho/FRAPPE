@@ -13,3 +13,8 @@ Media compression standards have reached a plateau in terms of the rate-distorti
 FRAPPE is integrated in the compressors library:
 
 `pip install compressors`
+
+## Deployment
+
+For packaging the INT8 encoder for an Intel NPU with a CUDA ONNX Runtime
+decoder, see [docs/NPU_INT8_ENCODER_CUDA_DECODER.md](docs/NPU_INT8_ENCODER_CUDA_DECODER.md).
