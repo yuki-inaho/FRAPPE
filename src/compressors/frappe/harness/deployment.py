@@ -119,6 +119,73 @@ def dynamic_shapes(model: JointPrefixFRAPPE, max_units: int = 4096):
     return image, planes
 
 
+def measure_deployed_conditions(compiled_conditions: dict[str, object], decoder, folder,
+                                indices, *, scale_groups, plan, prefix, height, width,
+                                device) -> dict[str, dict]:
+    """Rate-distortion of every compiled encoder condition over the same images.
+
+    Every condition is an already-compiled inference model that maps a uint8
+    image to the uint8 planes; the decoder is the one frozen fp32 torch graph
+    shared by all conditions. The first condition in the mapping is the
+    reference: later conditions additionally report how many integer codes
+    they flip against it, which is how arithmetic drift between runtimes is
+    measured rather than assumed away. Distortion follows the harness
+    convention (aggregate MSE on ``[0, 1]``) and rate counts payload-only
+    bytes.
+    """
+    import numpy as np
+    import torch.nn.functional as F
+
+    from .bitstream import BitstreamConvention, measure_rate
+    from .metrics import Averaging, RateDistortionAccumulator
+
+    results: dict[str, dict] = {}
+    reference_planes: list[list] = []
+    names = list(compiled_conditions)
+    for name in names:
+        compiled = compiled_conditions[name]
+        accumulator = RateDistortionAccumulator(Averaging.AGGREGATE_MSE)
+        mismatched = max_difference = saturated = 0
+        for position, index in enumerate(indices):
+            image = folder.pixels(index)
+            result = compiled({0: image.numpy()})
+            planes = [result[i] for i in range(len(scale_groups))]
+            if name == names[0]:
+                reference_planes.append(planes)
+            else:
+                for got, want in zip(planes, reference_planes[position]):
+                    difference = np.abs(got.astype(np.int32) - want.astype(np.int32))
+                    mismatched += int((difference > 0).sum())
+                    max_difference = max(max_difference, int(difference.max()))
+            latents = []
+            for plane, (ps, start, end) in zip(planes, scale_groups):
+                h, w = height // ps, width // ps
+                saturated += int((plane == 255).sum())
+                latents.append(torch.from_numpy(
+                    plane.reshape(1, end - start, h, w).astype(np.int64) - CODE_OFFSET
+                ).to(torch.int8))
+            byte_count, _ = measure_rate(latents, height * width, plan,
+                                         BitstreamConvention.PAYLOAD_ONLY)
+            with torch.no_grad():
+                # DecoderGraph ships image bytes (uint8 0..255); the distortion
+                # convention elsewhere in the harness works on [0, 1].
+                reconstruction = decoder(*[torch.from_numpy(plane).to(device)
+                                           for plane in planes]).float() / 255.0
+            image_signed = folder.signed(index, device)
+            mse = F.mse_loss(image_signed / 2 + 0.5, reconstruction).item()
+            accumulator.add(mse, byte_count, height * width)
+        point = accumulator.point(label=prefix)
+        results[name] = {
+            "psnr_db": point.psnr_db, "bpp": point.bpp,
+            "bytes_total": point.bytes_total,
+            "compression_ratio": point.compression_ratio,
+            "saturated_symbols": saturated,
+            "mismatched_symbols_vs_reference": mismatched,
+            "max_symbol_difference_vs_reference": max_difference,
+        }
+    return results
+
+
 def describe(path: str | Path) -> dict:
     """The graph's declared input and output signature, as deployed code sees it."""
     import onnx

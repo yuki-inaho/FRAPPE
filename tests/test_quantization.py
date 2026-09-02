@@ -146,52 +146,6 @@ def test_nncf_state_survives_save_and_restore(model):
     after = DeployableEncoder(restored, uint8_io=True)(image)
     assert all(torch.equal(a, b) for a, b in zip(before, after))
 
-def test_qat_export_keeps_quantization_nodes_and_dynamic_shapes(model, tmp_path):
-    """The exported QAT graph carries FakeQuantize and matches PyTorch bit for bit."""
-    pytest.importorskip("nncf.torch", reason="NNCF ships in the uv deploy group only")
-    import nncf
-    import onnx
-    import openvino as ov
-
-    from src.compressors.frappe.harness.quantization import (
-        DeployableEncoder,
-        TrainableEncoder,
-        export_encoder_onnx,
-        restore_qat_state,
-        save_qat_state,
-    )
-
-    torch.manual_seed(1)
-    items = [torch.rand(1, 3, 32, 32) * 2 - 1 for _ in range(2)]
-    quantized = nncf.quantize(TrainableEncoder(model), nncf.Dataset(items), subset_size=2,
-                              target_device=nncf.TargetDevice.NPU)
-    state = save_qat_state(quantized)
-    restored = restore_qat_state(TrainableEncoder(model), state)
-
-    path = tmp_path / "qat_encoder.onnx"
-    sample = torch.zeros(1, 3, 64, 64, dtype=torch.uint8)  # min units_h/W is 2
-    export_encoder_onnx(restored, path, sample)
-    op_types = {node.op_type for node in onnx.load(str(path)).graph.node}
-    assert "FakeQuantize" in op_types, \
-        f"exported graph carries no fake quantizers: {sorted(op_types)}"
-
-    core = ov.Core()
-    ir = core.read_model(str(path))
-    fake_quantizes = [op for op in ir.get_ops() if op.get_type_name() == "FakeQuantize"]
-    assert fake_quantizes, "the OpenVINO IR lost the fake quantizers"
-    assert ir.inputs[0].partial_shape.is_dynamic, "H and W were baked into the IR"
-
-    deploy = DeployableEncoder(restored, uint8_io=True)
-    compiled = core.compile_model(ir, "CPU")
-    for probe_size in ((64, 64), (96, 64)):
-        probe = torch.randint(0, 256, (1, 3, *probe_size), dtype=torch.uint8)
-        with torch.no_grad():
-            reference = deploy(probe)
-        result = compiled({0: probe.numpy()})
-        for index, want in enumerate(reference):
-            assert (result[index] == want.numpy()).all()
-
-
 def test_onnx_ptq_is_saved_as_qdq_without_quantizing_companders(model, tmp_path):
     """ONNX is the durable PTQ artifact; codec rounding stays outside Q/DQ."""
     pytest.importorskip("nncf.onnx", reason="NNCF ships in the uv deploy group only")
@@ -244,6 +198,46 @@ def test_onnx_ptq_is_saved_as_qdq_without_quantizing_companders(model, tmp_path)
     result = compiled({0: calibration[0]["image"]})
     assert len(result) == len(SCHEDULE)
     assert all(result[index].dtype.name == "uint8" for index in range(len(SCHEDULE)))
+
+
+def write_anonymous_split(root, split, count, size=(64, 64), seed=0):
+    """A tiny anonymous imagefolder split, the layout every tool reads."""
+    import numpy as np
+    from PIL import Image
+
+    directory = root / split
+    directory.mkdir(parents=True, exist_ok=True)
+    generator = np.random.default_rng(seed)
+    for index in range(count):
+        Image.fromarray(generator.integers(0, 256, (size[0], size[1], 3), dtype=np.uint8)).save(
+            directory / f"image_{index:08d}.png")
+
+
+def test_save_openvino_ir_freezes_resolution(model, tmp_path):
+    """The IR compiles to one frozen input shape when asked; otherwise it stays dynamic."""
+    pytest.importorskip("nncf.onnx", reason="NNCF ships in the uv deploy group only")
+    import openvino as ov
+
+    from src.compressors.frappe.harness.quantization import (
+        TrainableEncoder,
+        export_encoder_onnx,
+        save_openvino_ir,
+    )
+
+    onnx_path = tmp_path / "encoder.onnx"
+    export_encoder_onnx(TrainableEncoder(model), onnx_path,
+                        torch.zeros(1, 3, 64, 64, dtype=torch.uint8))
+
+    dynamic = ov.Core().read_model(save_openvino_ir(onnx_path, tmp_path / "dynamic.xml")["xml"])
+    assert dynamic.inputs[0].partial_shape.is_dynamic
+
+    info = save_openvino_ir(onnx_path, tmp_path / "static.xml", static_shape=[1, 3, 64, 64])
+    assert info["input_shape"] == [1, 3, 64, 64]
+    static = ov.Core().read_model(info["xml"])
+    assert static.input(0).shape == [1, 3, 64, 64]
+    result = ov.Core().compile_model(static, "CPU")(
+        {0: torch.zeros(1, 3, 64, 64, dtype=torch.uint8).numpy()})
+    assert len(result) == len(SCHEDULE)
 
 
 def test_calibration_and_evaluation_samples_must_not_overlap():

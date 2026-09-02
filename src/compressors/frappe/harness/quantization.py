@@ -333,6 +333,47 @@ def quantize_onnx_encoder(
     }
 
 
+def op_inventory(nodes) -> dict[str, int]:
+    """How many of each operator kind a graph carries.
+
+    Accepts ONNX nodes (``op_type``), OpenVINO ops (``get_type_name``) or
+    already-extracted strings, so one helper reports on both runtimes.
+    """
+    counts: dict[str, int] = {}
+    for node in nodes:
+        if isinstance(node, str):
+            kind = node
+        elif hasattr(node, "get_type_name"):
+            kind = node.get_type_name()
+        else:
+            kind = node.op_type
+        counts[kind] = counts.get(kind, 0) + 1
+    return counts
+
+
+def save_openvino_ir(onnx_path: str | Path, xml_path: str | Path,
+                     static_shape: Sequence[int] | None = None) -> dict[str, Any]:
+    """Convert a saved ONNX graph to an OpenVINO IR and persist it as xml + bin.
+
+    A ``static_shape`` freezes the IR to one input resolution, which is what a
+    shape-fixed deployment target compiles; leaving it ``None`` keeps whatever
+    dynamism the graph declares.
+    """
+    import openvino as ov
+
+    core = ov.Core()
+    model = core.read_model(str(onnx_path))
+    if static_shape is not None:
+        model.reshape([int(dimension) for dimension in static_shape])
+    xml_path = Path(xml_path)
+    xml_path.parent.mkdir(parents=True, exist_ok=True)
+    # fp16 weight compression would re-round every weight behind the QDQ
+    # grid's back; the int8 story lives in the Q/DQ pairs, not in fp16.
+    ov.save_model(model, str(xml_path), compress_to_fp16=False)
+    return {"xml": str(xml_path), "bin": str(xml_path.with_suffix(".bin")),
+            "input_shape": list(static_shape) if static_shape is not None else None}
+
+
 def sha256_of(path: str | Path) -> str:
     """The digest recorded next to every derived artifact, so comparisons can't drift."""
     digest = hashlib.sha256()
