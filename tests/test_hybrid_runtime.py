@@ -146,3 +146,35 @@ def test_corrupted_manifest_hash_refuses_to_run(packaged):
     tampered["artifacts"][first]["sha256"] = "0" * 64
     with pytest.raises(RuntimeError, match="sha256"):
         OpenVINOEncoder(output, "CPU", tampered)
+
+
+def test_roundtrip_report_travels_without_local_paths(packaged, monkeypatch):
+    """The report identifies the package by hash, never by where the data lived."""
+    from src.compressors.frappe.harness import hybrid_runtime
+    from src.compressors.frappe.harness.quantization import sha256_of
+
+    manifest = packaged["manifest"]
+
+    class StubDecoder:
+        def __init__(self, artifact_dir=None, manifest=None):  # noqa: ARG002
+            self.manifest = manifest
+
+        def reconstruct(self, planes):  # noqa: ARG002
+            return np.zeros(manifest["image_shape_nchw"], dtype=np.uint8)
+
+    monkeypatch.setattr(hybrid_runtime, "CudaOnnxDecoder", StubDecoder)
+    report = hybrid_runtime.run_roundtrip(
+        packaged["output"],
+        packaged["root"] / "data",
+        "validation",
+        0,
+        1,
+        encoder_device="CPU",
+        entropy_backend="pillow",
+    )
+    assert "dataset_root" not in report
+    assert "artifact_dir" not in report
+    assert report["manifest_sha256"] == sha256_of(packaged["output"] / "manifest.json")
+    assert report["images"] == 1 and report["image_indices"] == [0]
+    assert report["jpegls_roundtrip_exact"] is True
+    assert report["decoder"]["provider"] == "CUDAExecutionProvider"

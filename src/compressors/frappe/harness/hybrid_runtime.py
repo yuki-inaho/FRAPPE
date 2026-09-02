@@ -277,10 +277,10 @@ def run_roundtrip(
         bytes_total += payload
         bytes_with_prefix += payload + length_prefix_bytes
     psnr = -10 * np.log10(mse_total / pixels_total)
+    # The report travels: the package is identified by its manifest hash and
+    # the record says what executed, never where the data lived.
     return {
         "manifest_sha256": sha256_of(Path(artifact_dir) / "manifest.json"),
-        "artifact_dir": str(artifact_dir),
-        "dataset_root": str(dataset_root),
         "split": split,
         "images": len(indices),
         "image_indices": indices,
