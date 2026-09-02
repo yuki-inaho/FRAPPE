@@ -46,6 +46,11 @@ class TrainableEncoder(torch.nn.Module):
         super().__init__()
         self.analysis = model.analysis
         self.companders = model.companders
+        # The shape algebra travels with the encoder, so a quantized wrapper
+        # still answers for its scale groups when the exporter asks.
+        self.ps = model.ps
+        self.scale_groups = model.scale_groups
+        self.input_channels = model.input_channels
 
     def forward(self, image: torch.Tensor, mode: str = "hard", alpha: float = 8.0):
         return [compander(analysis(image), mode, alpha)
@@ -56,24 +61,26 @@ class DeployableEncoder(torch.nn.Module):
     """Wraps a (possibly fake-quantized) trainable encoder for deployment.
 
     The wrapping, not a copy, is the point: the quantizers the trainer updated
-    are the quantizers the exporter sees. The forward reproduces
-    ``EncoderGraph``'s real round/clamp/shift -- the honest bitstream, not the
-    straight-through relaxation -- so planes from a fake-quant-free encoder are
-    bit-identical to the shipped graph's.
+    are the quantizers the exporter sees. The forward calls the encoder's own
+    ``__call__`` -- not its submodules -- because NNCF's hooks fire only there;
+    stepping around the parent would silently export the FP32 arithmetic. The
+    codes it returns are already the integer bitstream values, so the view only
+    flattens and shifts them into the planes JPEG-LS consumes.
     """
 
     def __init__(self, encoder: TrainableEncoder, uint8_io: bool) -> None:
         super().__init__()
         self.encoder = encoder
         self.uint8_io = uint8_io
+        self.ps = encoder.ps
+        self.scale_groups = encoder.scale_groups
+        self.input_channels = encoder.input_channels
 
     def forward(self, image: torch.Tensor):
         x = image.to(torch.float32) / 127.5 - 1.0 if self.uint8_io else image
         planes = []
-        for analysis, compander in zip(self.encoder.analysis, self.encoder.companders):
-            codes = torch.clamp(torch.round(compander.companded(analysis(x))),
-                                -CODE_OFFSET, CODE_OFFSET)
-            plane = torch.flatten(codes, 1, 2)
+        for code in self.encoder(x):
+            plane = torch.flatten(code, 1, 2)
             planes.append((plane + CODE_OFFSET).to(torch.uint8) if self.uint8_io
                           else plane.to(torch.int8))
         return tuple(planes)
@@ -153,6 +160,36 @@ def load_qat_checkpoint(path: str | Path, encoder: TrainableEncoder) -> dict[str
     return {"model": restored, "iteration": payload["iteration"],
             "optimizer_state": payload["optimizer"],
             "base_checkpoint_sha256": payload["base_checkpoint_sha256"]}
+
+
+def export_encoder_onnx(quantized: torch.nn.Module, output_path: str | Path,
+                       sample_image: torch.Tensor, opset: int = 17) -> dict[str, Any]:
+    """Export a (possibly fake-quantized) encoder as the deployed ONNX graph.
+
+    A fake-quantized input yields ``FakeQuantize`` operators in the graph; a
+    plain encoder yields the clean FP32 arithmetic. Either way the same trace
+
+    The TorchScript tracer is deliberate: it executes NNCF's hook machinery for
+    real while tracing, so the fake-quant arithmetic lands in the graph as
+    ``FakeQuantize`` operators -- the form OpenVINO folds into true INT8.
+    ``torch.export`` cannot trace the hook executor's function mode at all, and
+    NNCF 3.3 offers no way through: ``StripFormat.DQ`` rejects these quantizers
+    (``half_range``), and a ``NATIVE`` strip leaves the mode active. The
+    quantized model itself stays untouched; H and W stay symbolic through
+    ``dynamic_axes``.
+    """
+    from .deployment import plane_names
+
+    deploy = DeployableEncoder(quantized, uint8_io=True).eval()
+    axes = {"image": {2: "height", 3: "width"},
+            **{f"plane_p{ps}": {1: f"rows_p{ps}", 2: f"cols_p{ps}"}
+               for ps, _, _ in quantized.scale_groups}}
+    output_path = Path(output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    torch.onnx.export(deploy, (sample_image,), str(output_path), input_names=["image"],
+                      output_names=plane_names(quantized), dynamic_axes=axes,
+                      opset_version=opset, dynamo=False)
+    return {"path": str(output_path), "opset": opset}
 
 
 def sha256_of(path: str | Path) -> str:

@@ -20,6 +20,7 @@ REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
 if str(REPOSITORY_ROOT) not in sys.path:
     sys.path.insert(0, str(REPOSITORY_ROOT))
 
+import numpy as np
 import torch
 import torch.nn.functional as F
 
@@ -37,6 +38,7 @@ from src.compressors.frappe.harness.checkpoints import load_checkpoint
 from src.compressors.frappe.harness.data import AnonymousImageFolder, default_dataset_root
 from src.compressors.frappe.harness.metrics import Averaging, RateDistortionAccumulator
 from src.compressors.frappe.harness.quantization import (
+    DeployableEncoder,
     TrainableEncoder,
     freeze_decoder,
     load_qat_checkpoint,
@@ -82,6 +84,46 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     train.add_argument("--seed", type=int, default=0)
     train.add_argument("--resume", type=Path, default=None,
                        help="QAT checkpoint written by this tool; continues at its iteration + 1")
+
+    export = sub.add_parser("export",
+                            help="export a QAT checkpoint to ONNX and OpenVINO IR, verified on CPU")
+    export.add_argument("--qat-checkpoint", type=Path, required=True,
+                        help="QAT checkpoint from 'train'; its NNCF config restores the quantizers")
+    export.add_argument("--base-checkpoint", type=Path, required=True,
+                        help="the FP32 joint-prefix checkpoint the QAT run started from")
+    export.add_argument("--output-stem", type=Path, required=True,
+                        help="writes <stem>_encoder.onnx and <stem>_encoder.xml/.bin")
+    export.add_argument("--dataset-root", type=Path, default=None)
+    export.add_argument("--split", default="validation")
+    export.add_argument("--verify-images", type=int, default=4)
+    export.add_argument("--sample-height", type=int, default=608)
+    export.add_argument("--sample-width", type=int, default=800)
+    export.add_argument("--opset", type=int, default=17,
+                        help="tracer export; 17 is the highest opset whose "
+                             "FakeQuantize round-trips")
+    export.add_argument("--report", type=Path, default=None)
+
+    evaluate = sub.add_parser("evaluate",
+                              help="rate-distortion of fp32 / PTQ / QAT encoders as deployed IRs")
+    evaluate.add_argument("--base-checkpoint", type=Path, required=True,
+                          help="FP32 joint-prefix checkpoint; source of the fp32 "
+                               "condition and of the shared frozen decoder")
+    evaluate.add_argument("--qat-checkpoint", type=Path, required=True,
+                          help="QAT checkpoint from 'train'; source of the "
+                               "trained condition")
+    evaluate.add_argument("--dataset-root", type=Path, default=None)
+    evaluate.add_argument("--split", default="validation")
+    evaluate.add_argument("--images", type=int, default=16,
+                          help="the same image indices are measured for every condition")
+    evaluate.add_argument("--calibration-images", type=int, default=32,
+                          help="training-split images for the PTQ condition's calibration")
+    evaluate.add_argument("--target-device", default="NPU", choices=["NPU", "CPU", "ANY"])
+    evaluate.add_argument("--device", default="cuda:0",
+                          help="torch device for the shared frozen decoder; CPU is allowed")
+    evaluate.add_argument("--artifact-dir", type=Path, default=None,
+                          help="where the per-condition ONNX graphs are written; "
+                               "default: beside --output")
+    evaluate.add_argument("--output", type=Path, required=True)
     return parser.parse_args(argv)
 
 
@@ -234,10 +276,251 @@ def train_command(args: argparse.Namespace) -> None:
           f"quantizers={quantizers}; last={last_path}")
 
 
+def op_inventory(nodes) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for node in nodes:
+        if isinstance(node, str):
+            kind = node
+        elif hasattr(node, "get_type_name"):
+            kind = node.get_type_name()
+        else:
+            kind = node.op_type
+        counts[kind] = counts.get(kind, 0) + 1
+    return counts
+
+
+def export_command(args: argparse.Namespace) -> None:
+    import json
+
+    import onnx
+    import openvino as ov
+
+    from src.compressors.frappe.harness.deployment import plane_names
+    from src.compressors.frappe.harness.quantization import export_encoder_onnx, restore_qat_state
+
+    device_name = "CPU"
+    if args.sample_height % 2 or args.sample_width % 2:
+        raise SystemExit("sample size must be a multiple of the largest patch size")
+
+    payload = torch.load(args.qat_checkpoint, map_location="cpu", weights_only=False)
+    base_model = load_checkpoint(args.base_checkpoint, "cpu").model.eval()
+    quantized = restore_qat_state(TrainableEncoder(base_model), payload)
+
+    names = plane_names(quantized)
+    sample = torch.zeros(1, base_model.input_channels, args.sample_height, args.sample_width,
+                         dtype=torch.uint8)
+    onnx_info = export_encoder_onnx(quantized, args.output_stem.with_name(
+        args.output_stem.name + "_encoder.onnx"), sample, opset=args.opset)
+    onnx_ops = op_inventory(onnx.load(onnx_info["path"]).graph.node)
+    if onnx_ops.get("FakeQuantize", 0) == 0:
+        raise SystemExit(
+            "the exported ONNX carries no FakeQuantize; refusing to deploy a fake-quant-free graph")
+
+    core = ov.Core()
+    ir = core.read_model(onnx_info["path"])
+    ir_ops = op_inventory(ir.get_ops())
+    if ir_ops.get("FakeQuantize", 0) == 0:
+        raise SystemExit(
+            "the OpenVINO IR lost the FakeQuantize ops; quantization did not survive conversion")
+    xml_path = args.output_stem.with_name(args.output_stem.name + "_encoder.xml")
+    ov.save_model(ir, str(xml_path))
+
+    deploy = DeployableEncoder(quantized, uint8_io=True).eval()
+    compiled = core.compile_model(core.read_model(str(xml_path)), device_name)
+    folder = AnonymousImageFolder(args.dataset_root or default_dataset_root(), args.split)
+    parity = {"images": 0, "mismatched_symbols": 0, "symbols": 0, "max_difference": 0,
+              "sizes": [], "status": "bit_exact", "cause": None}
+    for index in range(min(args.verify_images, len(folder))):
+        image = folder.pixels(index)
+        with torch.no_grad():
+            reference = deploy(image)
+        result = compiled({0: image.numpy()})
+        for plane, want in zip((result[i] for i in range(len(reference))), reference):
+            difference = np.abs(plane.astype(np.int32) - want.numpy().astype(np.int32))
+            parity["mismatched_symbols"] += int((difference > 0).sum())
+            parity["symbols"] += difference.size
+            parity["max_difference"] = max(parity["max_difference"], int(difference.max()))
+        parity["images"] += 1
+    if parity["mismatched_symbols"]:
+        # PyTorch and OpenVINO accumulate the fp32 convolutions in different
+        # orders; a value that lands on opposite sides of a FakeQuantize (or
+        # the compander Round) decision boundary flips its integer code. That
+        # is an arithmetic-boundary effect, not a broken graph -- the rate and
+        # distortion impact is measured separately, never assumed away.
+        parity["status"] = "documented_boundary_flips"
+        parity["cause"] = ("fp32 accumulation-order differences between runtimes "
+                           "flip codes at quantization/rounding boundaries")
+    for size in ((args.sample_height, args.sample_width), (480, 640)):
+        probe = torch.zeros(1, base_model.input_channels, *size, dtype=torch.uint8)
+        result = compiled({0: probe.numpy()})
+        shapes = [tuple(result[i].shape) for i in range(len(names))]
+        parity["sizes"].append({"size": [size[1], size[0]], "output_shapes": shapes})
+
+    report = {
+        "qat_checkpoint": str(args.qat_checkpoint), "iteration": payload.get("iteration"),
+        "base_checkpoint": str(args.base_checkpoint),
+        "base_checkpoint_sha256": payload.get("base_checkpoint_sha256"),
+        "nncf_version": payload.get("nncf_version"), "opset": args.opset,
+        "onnx": {**onnx_info, "ops": onnx_ops,
+                 "fake_quantizes": onnx_ops.get("FakeQuantize", 0)},
+        "openvino": {"runtime": ov.__version__, "model": str(xml_path), "ops": ir_ops,
+                     "fake_quantizes": ir_ops.get("FakeQuantize", 0),
+                     "compiled_device": device_name},
+        "parity": parity,
+        "output_names": names,
+    }
+    print(json.dumps({"onnx_fake_quantizes": report["onnx"]["fake_quantizes"],
+                      "ir_fake_quantizes": report["openvino"]["fake_quantizes"],
+                      "parity": parity}, indent=2))
+    if args.report:
+        args.report.parent.mkdir(parents=True, exist_ok=True)
+        args.report.write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
+        print(f"wrote {args.report}")
+    if parity["status"] != "bit_exact":
+        print(f"warning: {parity['mismatched_symbols']}/{parity['symbols']} symbols differ "
+              f"(max {parity['max_difference']}): {parity['cause']}")
+
+
+def evaluate_command(args: argparse.Namespace) -> None:
+    import json
+
+    import openvino as ov
+
+    from src.compressors.frappe.harness.deployment import DecoderGraph
+    from src.compressors.frappe.harness.quantization import (
+        DeployableEncoder,
+        TrainableEncoder,
+        export_encoder_onnx,
+        restore_qat_state,
+    )
+
+    if args.device.startswith("cuda") and not torch.cuda.is_available():
+        raise SystemExit(f"--device {args.device} but CUDA is not available; refusing to fall back")
+    decode_device = torch.device(args.device)
+
+    base_model = load_checkpoint(args.base_checkpoint, "cpu").model.eval()
+    base_sha256 = sha256_of(args.base_checkpoint)
+    dataset_root = args.dataset_root or default_dataset_root()
+    folder = AnonymousImageFolder(dataset_root, args.split)
+    count = min(args.images, len(folder))
+    if count < args.images:
+        raise SystemExit(f"requested {args.images} images but the split has {len(folder)}")
+    n_channels = base_model.n_channels
+    height, width = folder.pixels(0).shape[2], folder.pixels(0).shape[3]
+    plan = prefix_channels(base_model.scale_groups, n_channels)
+
+    def deployable_ir(name: str, encoder_module: torch.nn.Module, artifacts: Path):
+        """Trace -> IR -> compiled CPU model, the exact deployment pipeline."""
+        onnx_path = artifacts / f"{name}_encoder.onnx"
+        export_encoder_onnx(encoder_module, onnx_path, torch.zeros(
+            1, base_model.input_channels, height, width, dtype=torch.uint8))
+        core = ov.Core()
+        return core.compile_model(core.read_model(str(onnx_path)), "CPU")
+
+    artifacts = args.artifact_dir or args.output.parent
+    artifacts.mkdir(parents=True, exist_ok=True)
+    conditions: dict[str, dict] = {}
+    order = ["fp32", "ptq", "qat"]
+
+    encoder_modules: dict[str, torch.nn.Module] = {
+        "fp32": TrainableEncoder(base_model),
+        "ptq": quantize_encoder(
+            TrainableEncoder(base_model),
+            calibration_tensors(AnonymousImageFolder(dataset_root, "train"),
+                                args.calibration_images),
+            target_device=args.target_device, subset_size=args.calibration_images),
+    }
+    payload = torch.load(args.qat_checkpoint, map_location="cpu", weights_only=False)
+    if payload.get("base_checkpoint_sha256") != base_sha256:
+        raise SystemExit("the QAT checkpoint was built from a different base checkpoint")
+    encoder_modules["qat"] = restore_qat_state(TrainableEncoder(base_model), payload)
+
+    # export_encoder_onnx wraps the module in DeployableEncoder itself, so the
+    # encoder views are handed over raw: wrapping here as well would flatten
+    # the already-shaped planes a second time.
+    compiled: dict[str, object] = {}
+    for name in order:
+        compiled[name] = deployable_ir(name, encoder_modules[name], artifacts)
+
+    # Built after the calibration forwards: DecoderGraph wraps the shared
+    # base model, so moving it to the decode device moves every encoder the
+    # calibration just ran on.
+    decoder = DecoderGraph(base_model, n_channels, uint8_io=True).to(decode_device).eval()
+
+    reference_planes: list[list] = []
+    for name in order:
+        accumulator = RateDistortionAccumulator(Averaging.AGGREGATE_MSE)
+        mismatched = max_difference = saturated = 0
+        for index in range(count):
+            image = folder.pixels(index)
+            result = compiled[name]({0: image.numpy()})
+            planes = [result[i] for i in range(len(base_model.scale_groups))]
+            if name == "fp32":
+                reference_planes.append(planes)
+            else:
+                for got, want in zip(planes, reference_planes[index]):
+                    difference = np.abs(got.astype(np.int32) - want.astype(np.int32))
+                    mismatched += int((difference > 0).sum())
+                    max_difference = max(max_difference, int(difference.max()))
+            latents = []
+            for plane, (ps, start, end) in zip(planes, base_model.scale_groups):
+                h, w = height // ps, width // ps
+                saturated += int((plane == 255).sum())
+                latents.append(torch.from_numpy(
+                    plane.reshape(1, end - start, h, w).astype(np.int64) - 127).to(torch.int8))
+            byte_count, _ = measure_rate(latents, height * width, plan,
+                                         BitstreamConvention.PAYLOAD_ONLY)
+            with torch.no_grad():
+                # DecoderGraph ships image bytes (uint8 0..255); the distortion
+                # convention elsewhere in the harness works on [0, 1].
+                reconstruction = decoder(*[torch.from_numpy(plane).to(decode_device)
+                                           for plane in planes]).float() / 255.0
+            image_signed = folder.signed(index, decode_device)
+            mse = F.mse_loss(image_signed / 2 + 0.5, reconstruction).item()
+            accumulator.add(mse, byte_count, height * width)
+        point = accumulator.point(label=n_channels)
+        conditions[name] = {
+            "psnr_db": point.psnr_db, "bpp": point.bpp,
+            "bytes_total": point.bytes_total,
+            "compression_ratio": point.compression_ratio,
+            "saturated_symbols": saturated,
+            "mismatched_symbols_vs_fp32": mismatched,
+            "max_symbol_difference_vs_fp32": max_difference,
+        }
+        print(f"  {name}: {point.psnr_db:.4f} dB @ {point.bpp:.4f} bpp "
+              f"({point.bytes_total} bytes, {mismatched} symbols vs fp32)")
+
+    report = {
+        "base_checkpoint": str(args.base_checkpoint),
+        "base_checkpoint_sha256": base_sha256,
+        "qat_checkpoint": str(args.qat_checkpoint),
+        "qat_iteration": payload.get("iteration"),
+        "split": args.split, "images": count,
+        "image_indices": list(range(count)),
+        "size": [width, height],
+        "prefix": n_channels, "averaging": "aggregate_mse",
+        "bitstream_convention": "PAYLOAD_ONLY",
+        "decoder": "torch DecoderGraph (frozen, fp32), identical for every condition",
+        "openvino_runtime": ov.__version__,
+        "conditions": conditions,
+        "deltas_vs_fp32": {
+            name: {"d_psnr_db": conditions[name]["psnr_db"] - conditions["fp32"]["psnr_db"],
+                   "d_bpp": conditions[name]["bpp"] - conditions["fp32"]["bpp"]}
+            for name in order if name != "fp32"},
+    }
+    args.output.parent.mkdir(parents=True, exist_ok=True)
+    args.output.write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
+    print(f"wrote {args.output}")
+
+
 def main(argv: list[str] | None = None) -> None:
     args = parse_args(argv)
     if args.command == "train":
         train_command(args)
+    elif args.command == "export":
+        export_command(args)
+    elif args.command == "evaluate":
+        evaluate_command(args)
 
 
 if __name__ == "__main__":

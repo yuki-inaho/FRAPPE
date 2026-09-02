@@ -46,6 +46,11 @@ class EncoderGraph(torch.nn.Module):
         self.analysis = model.analysis
         self.companders = model.companders
         self.uint8_io = uint8_io
+        # The shape algebra rides along so one exporter can serve both this
+        # graph and its quantized twin.
+        self.ps = model.ps
+        self.scale_groups = model.scale_groups
+        self.input_channels = model.input_channels
 
     def forward(self, image: torch.Tensor):
         x = image.to(torch.float32) / 127.5 - 1.0 if self.uint8_io else image

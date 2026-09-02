@@ -86,8 +86,10 @@ def test_deployment_view_matches_encoder_graph_planes(model):
     image = torch.randint(0, 256, (1, 3, 32, 32), dtype=torch.uint8)
     cases = [(True, image),
              (False, image.to(torch.float32) / 127.5 - 1.0)]
+    from src.compressors.frappe.harness.quantization import TrainableEncoder
+
     for uint8_io, feed in cases:
-        deploy = DeployableEncoder(model, uint8_io=uint8_io)
+        deploy = DeployableEncoder(TrainableEncoder(model), uint8_io=uint8_io)
         reference = EncoderGraph(model, uint8_io=uint8_io)
         produced, expected = deploy(feed), reference(feed)
         assert len(produced) == len(expected) == len(SCHEDULE)
@@ -143,3 +145,48 @@ def test_nncf_state_survives_save_and_restore(model):
     before = DeployableEncoder(quantized, uint8_io=True)(image)
     after = DeployableEncoder(restored, uint8_io=True)(image)
     assert all(torch.equal(a, b) for a, b in zip(before, after))
+
+def test_qat_export_keeps_quantization_nodes_and_dynamic_shapes(model, tmp_path):
+    """The exported QAT graph carries FakeQuantize and matches PyTorch bit for bit."""
+    pytest.importorskip("nncf.torch", reason="NNCF ships in the uv deploy group only")
+    import nncf
+    import onnx
+    import openvino as ov
+
+    from src.compressors.frappe.harness.quantization import (
+        DeployableEncoder,
+        TrainableEncoder,
+        export_encoder_onnx,
+        restore_qat_state,
+        save_qat_state,
+    )
+
+    torch.manual_seed(1)
+    items = [torch.rand(1, 3, 32, 32) * 2 - 1 for _ in range(2)]
+    quantized = nncf.quantize(TrainableEncoder(model), nncf.Dataset(items), subset_size=2,
+                              target_device=nncf.TargetDevice.NPU)
+    state = save_qat_state(quantized)
+    restored = restore_qat_state(TrainableEncoder(model), state)
+
+    path = tmp_path / "qat_encoder.onnx"
+    sample = torch.zeros(1, 3, 64, 64, dtype=torch.uint8)  # min units_h/W is 2
+    export_encoder_onnx(restored, path, sample)
+    op_types = {node.op_type for node in onnx.load(str(path)).graph.node}
+    assert "FakeQuantize" in op_types, \
+        f"exported graph carries no fake quantizers: {sorted(op_types)}"
+
+    core = ov.Core()
+    ir = core.read_model(str(path))
+    fake_quantizes = [op for op in ir.get_ops() if op.get_type_name() == "FakeQuantize"]
+    assert fake_quantizes, "the OpenVINO IR lost the fake quantizers"
+    assert ir.inputs[0].partial_shape.is_dynamic, "H and W were baked into the IR"
+
+    deploy = DeployableEncoder(restored, uint8_io=True)
+    compiled = core.compile_model(ir, "CPU")
+    for probe_size in ((64, 64), (96, 64)):
+        probe = torch.randint(0, 256, (1, 3, *probe_size), dtype=torch.uint8)
+        with torch.no_grad():
+            reference = deploy(probe)
+        result = compiled({0: probe.numpy()})
+        for index, want in enumerate(reference):
+            assert (result[index] == want.numpy()).all()

@@ -50,6 +50,8 @@ deploy = [
     "onnxruntime",
     "onnxsim",
     "onnxscript",
+    # NNCF's deployment strip (fake quantizers into native Q/DQ) builds on it.
+    "torchao",
     "beartype",
     "jaxtyping",
     "pytest",
