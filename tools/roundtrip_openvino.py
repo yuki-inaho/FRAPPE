@@ -57,6 +57,7 @@ from src.compressors.frappe.harness import (
 )
 from src.compressors.frappe.harness.checkpoints import load_checkpoint
 from src.compressors.frappe.harness.data import default_dataset_root
+from src.compressors.frappe.harness.profiling import RAW_BITS_PER_PIXEL, as_torch_planes, timed
 from src.compressors.frappe.harness.reporting import Table, write_report
 from src.compressors.frappe.openvino_runtime import (
     FrappeDecoder,
@@ -65,17 +66,6 @@ from src.compressors.frappe.openvino_runtime import (
     select_device,
     testbed,
 )
-
-#: 8 bits per channel, three channels: the raw rate a compression ratio is against.
-RAW_BITS_PER_PIXEL = 24.0
-
-
-def as_torch_planes(planes) -> list[torch.Tensor]:
-    """OpenVINO's ``(1, rows, cols)`` uint8 arrays as the harness's 2D tensors."""
-    return [
-        torch.from_numpy(np.ascontiguousarray(plane[0] if plane.ndim == 3 else plane))
-        for plane in planes
-    ]
 
 
 def rate_of(planes, pixels: int) -> dict:
@@ -103,19 +93,6 @@ def reference_planes(checkpoint: Path, image: torch.Tensor) -> list[torch.Tensor
     x = image.to(torch.float32) / 127.5 - 1.0
     with torch.no_grad():
         return arrange_planes(loaded.model.integer_codes(x))
-
-
-def timed(call, warmup: int, repeats: int):
-    """Median of ``repeats`` timed calls after ``warmup`` untimed ones."""
-    result = call()
-    for _ in range(max(0, warmup - 1)):
-        result = call()
-    samples = []
-    for _ in range(max(1, repeats)):
-        started = time.perf_counter()
-        result = call()
-        samples.append((time.perf_counter() - started) * 1000.0)
-    return result, statistics.median(samples)
 
 
 def resolve(requested: str, prefer, core) -> tuple[str, list]:

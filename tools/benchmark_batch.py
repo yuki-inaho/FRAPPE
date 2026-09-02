@@ -17,9 +17,7 @@ benchmarks here.
 from __future__ import annotations
 
 import argparse
-import statistics
 import sys
-import time
 from pathlib import Path
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
@@ -30,19 +28,14 @@ import numpy as np
 
 from src.compressors.frappe.harness import AnonymousImageFolder
 from src.compressors.frappe.harness.data import default_dataset_root
+from src.compressors.frappe.harness.profiling import series, steady_median
 from src.compressors.frappe.harness.reporting import Table, write_report
 from src.compressors.frappe.openvino_runtime import testbed
 
 
 def steady(call, iterations: int, warmup: int) -> float:
-    for _ in range(warmup):
-        call()
-    times = []
-    for _ in range(iterations):
-        started = time.perf_counter()
-        call()
-        times.append((time.perf_counter() - started) * 1000.0)
-    return statistics.median(times[len(times) // 2 :])
+    """Warm up, then take the steady median of the timed series."""
+    return steady_median(series(call, iterations + warmup))
 
 
 def parse_args(argv=None):

@@ -34,7 +34,6 @@ if str(REPOSITORY_ROOT) not in sys.path:
     sys.path.insert(0, str(REPOSITORY_ROOT))
 
 import numpy as np
-import torch
 
 from src.compressors.frappe.harness import (
     AnonymousImageFolder,
@@ -44,6 +43,12 @@ from src.compressors.frappe.harness import (
 )
 from src.compressors.frappe.harness.data import default_dataset_root
 from src.compressors.frappe.harness.metrics import psnr_from_mse
+from src.compressors.frappe.harness.profiling import (
+    RAW_BITS_PER_PIXEL,
+    as_torch_planes,
+    series,
+    steady_median,
+)
 from src.compressors.frappe.harness.reporting import Table, write_report
 from src.compressors.frappe.openvino_runtime import (
     FrappeDecoder,
@@ -51,30 +56,6 @@ from src.compressors.frappe.openvino_runtime import (
     bit_exact_properties,
     testbed,
 )
-
-#: 8 bits per channel, three channels: the raw rate a compression ratio is against.
-RAW_BITS_PER_PIXEL = 24.0
-
-
-def steady_median(times: list[float]) -> float:
-    """Median over the second half, so a warm-up tail cannot inflate it."""
-    return statistics.median(times[len(times) // 2 :])
-
-
-def series(action, iterations: int) -> list[float]:
-    times = []
-    for _ in range(iterations):
-        started = time.perf_counter()
-        action()
-        times.append((time.perf_counter() - started) * 1000.0)
-    return times
-
-
-def as_torch_planes(planes):
-    return [
-        torch.from_numpy(np.ascontiguousarray(plane[0] if plane.ndim == 3 else plane))
-        for plane in planes
-    ]
 
 
 @dataclass

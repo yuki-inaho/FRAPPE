@@ -43,6 +43,18 @@ _SPIFF_PREFIX_TEMPLATE = bytes.fromhex(
 _HEIGHT_OFFSET = 16
 _WIDTH_OFFSET = 20
 
+
+class FrameInfo(ctypes.Structure):
+    """``charls_frame_info``: the geometry CharLS writes into the SOF segment."""
+
+    _fields_ = [
+        ("width", ctypes.c_uint32),
+        ("height", ctypes.c_uint32),
+        ("bits_per_sample", ctypes.c_int32),
+        ("component_count", ctypes.c_int32),
+    ]
+
+
 _state: dict = {"lib": None, "error": None}
 
 
@@ -68,14 +80,6 @@ def _load():
 
 
 def _setup(lib) -> None:
-    class FrameInfo(ctypes.Structure):
-        _fields_ = [
-            ("width", ctypes.c_uint32),
-            ("height", ctypes.c_uint32),
-            ("bits_per_sample", ctypes.c_int32),
-            ("component_count", ctypes.c_int32),
-        ]
-
     lib.charls_jpegls_encoder_create.restype = ctypes.c_void_p
     lib.charls_jpegls_encoder_create.argtypes = []
     lib.charls_jpegls_encoder_destroy.argtypes = [ctypes.c_void_p]
@@ -106,7 +110,6 @@ def _setup(lib) -> None:
     ):
         getattr(lib, name).restype = ctypes.c_int
     lib.charls_get_error_message.restype = ctypes.c_int
-    _setup.frame_info = FrameInfo
 
 
 def available() -> bool:
@@ -147,7 +150,7 @@ def encode_plane(plane: np.ndarray) -> bytes:
     # NEAR=0 on 8-bit samples never exceeds one byte per sample plus markers;
     # twice that plus a page is cheap insurance against a pathological run.
     destination = (ctypes.c_char * (plane.size * 2 + 65536))()
-    frame_info = _setup.frame_info(width=width, height=height, bits_per_sample=8, component_count=1)
+    frame_info = FrameInfo(width=width, height=height, bits_per_sample=8, component_count=1)
     encoder = lib.charls_jpegls_encoder_create()
     if not encoder:
         raise RuntimeError("charls_jpegls_encoder_create returned null")

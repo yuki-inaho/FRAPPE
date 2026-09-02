@@ -34,7 +34,6 @@ REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
 if str(REPOSITORY_ROOT) not in sys.path:
     sys.path.insert(0, str(REPOSITORY_ROOT))
 
-import numpy as np
 import torch
 
 from src.compressors.frappe.harness import (
@@ -47,10 +46,14 @@ from src.compressors.frappe.harness import codecs as reference_codecs
 from src.compressors.frappe.harness.cli import add_output_argument
 from src.compressors.frappe.harness.data import default_dataset_root
 from src.compressors.frappe.harness.metrics import psnr_from_mse
+from src.compressors.frappe.harness.profiling import (
+    RAW_BITS_PER_PIXEL,
+    as_torch_planes,
+    series,
+    steady_median,
+)
 from src.compressors.frappe.harness.reporting import Table, write_report
 from src.compressors.frappe.openvino_runtime import FrappeDecoder, FrappeEncoder, testbed
-
-RAW_BITS_PER_PIXEL = 24.0
 
 #: The quality ladders swept for the reference codecs, chosen so each curve
 #: brackets FRAPPE's operating points from both sides at this resolution.
@@ -60,19 +63,6 @@ LADDERS = {
     "jpeg2000": [10, 15, 20, 30, 40],
     "avif": [42, 36, 30, 24, 18],
 }
-
-
-def steady_median(times):
-    return statistics.median(times[len(times) // 2 :])
-
-
-def series(action, iterations):
-    times = []
-    for _ in range(iterations):
-        started = time.perf_counter()
-        action()
-        times.append((time.perf_counter() - started) * 1000.0)
-    return times
 
 
 def parse_args(argv=None):
@@ -107,13 +97,6 @@ def parse_args(argv=None):
     )
     add_output_argument(parser, help_text="write the comparison here as JSON")
     return parser.parse_args(argv)
-
-
-def as_torch_planes(planes):
-    return [
-        torch.from_numpy(np.ascontiguousarray(plane[0] if plane.ndim == 3 else plane))
-        for plane in planes
-    ]
 
 
 def main(argv=None) -> None:
