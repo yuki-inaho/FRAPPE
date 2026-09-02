@@ -230,7 +230,37 @@ def free_pca_bound(fit: torch.Tensor, evaluate: torch.Tensor, ps_list: list[int]
             "fraction_of_dimension": symbols / float(fit_rows.shape[1])}
 
 
-def main() -> None:
+def print_summary(args: argparse.Namespace, report: dict) -> None:
+    """The three bounds side by side, and the two gaps between them.
+
+    The gap from greedy to joint is what stagewise ordering costs; the gap
+    from joint to free PCA is what the FRAPPE structure costs. Printing the
+    subtractions is the point of running all three.
+    """
+    print(f"\n  schedule: {len(args.ps)} channels, "
+          f"{report['raw_int8_bpp']:.3f} raw int8 bpp")
+    greedy = report["bounds"].get("greedy_klt")
+    if greedy:
+        print(f"  greedy-KLT (stagewise ideal)   float {greedy['psnr_db']:6.2f} dB"
+              f"   int8 {greedy['int8_psnr_db']:6.2f} dB"
+              f"   {greedy['measured_jpegls_bpp']:6.3f} bpp"
+              f"   CR {greedy['compression_ratio']:5.2f}")
+    joint = report["bounds"].get("joint_linear")
+    if joint:
+        print(f"  joint-linear (same structure)  float {joint['psnr_db']:6.2f} dB")
+    free = report["bounds"].get("free_pca")
+    if free:
+        print(f"  free PCA (linear upper bound)  float {free['psnr_db']:6.2f} dB"
+              f"   ({free['symbols_per_block']}/{free['block_dimension']} dims kept)")
+    if greedy and joint:
+        print(f"\n  cost of greedy stagewise ordering: "
+              f"{joint['psnr_db'] - greedy['psnr_db']:+.2f} dB")
+    if joint and free:
+        print(f"  cost of the FRAPPE structural constraint: "
+              f"{free['psnr_db'] - joint['psnr_db']:+.2f} dB")
+
+
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--dataset-root", type=Path, default=default_dataset_root(),
                         help="anonymous ImageFolder root; defaults to $FRAPPE_DATASET_ROOT")
@@ -254,7 +284,11 @@ def main() -> None:
                         help="block size for the unconstrained bound; default: max(--ps)")
     parser.add_argument("--output", type=Path, default=None)
     parser.add_argument("--quiet", action="store_true")
-    args = parser.parse_args()
+    return parser.parse_args(argv)
+
+
+def main(argv: list[str] | None = None) -> None:
+    args = parse_args(argv)
 
     device = args.device if torch.cuda.is_available() else "cpu"
     groups = scale_groups(args.ps)
@@ -308,26 +342,7 @@ def main() -> None:
 
     report["seconds"] = time.time() - started
 
-    print(f"\n  schedule: {len(args.ps)} channels, {raw_bpp:.3f} raw int8 bpp")
-    greedy = report["bounds"].get("greedy_klt")
-    if greedy:
-        print(f"  greedy-KLT (stagewise ideal)   float {greedy['psnr_db']:6.2f} dB"
-              f"   int8 {greedy['int8_psnr_db']:6.2f} dB"
-              f"   {greedy['measured_jpegls_bpp']:6.3f} bpp"
-              f"   CR {greedy['compression_ratio']:5.2f}")
-    joint = report["bounds"].get("joint_linear")
-    if joint:
-        print(f"  joint-linear (same structure)  float {joint['psnr_db']:6.2f} dB")
-    free = report["bounds"].get("free_pca")
-    if free:
-        print(f"  free PCA (linear upper bound)  float {free['psnr_db']:6.2f} dB"
-              f"   ({free['symbols_per_block']}/{free['block_dimension']} dims kept)")
-    if greedy and joint:
-        print(f"\n  cost of greedy stagewise ordering: "
-              f"{joint['psnr_db'] - greedy['psnr_db']:+.2f} dB")
-    if joint and free:
-        print(f"  cost of the FRAPPE structural constraint: "
-              f"{free['psnr_db'] - joint['psnr_db']:+.2f} dB")
+    print_summary(args, report)
 
     if args.output:
         args.output.parent.mkdir(parents=True, exist_ok=True)

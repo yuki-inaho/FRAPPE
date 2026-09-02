@@ -39,6 +39,54 @@ from src.compressors.frappe.harness.pruning import (  # noqa: E402
 )
 
 
+def select_at_targets(model, images, codes_cache, meter, rates, scores, frontier,
+                      args, report) -> None:
+    """What each criterion keeps at each target rate, measured rather than assumed.
+
+    Alongside every proxy sits the best prefix that fits the budget and, when the
+    oracle ran, the best subset it found. The proxies are worth exactly what that
+    comparison says they are, which on a model trained without a rate term is not
+    much: Taylor and Fisher pick non-prefix sets that collapse by 10 dB, because
+    the decoder has only ever seen nested masks.
+    """
+    print("\n  channel subsets selected at each target compression ratio:")
+    for target in args.target_compression:
+        budget = 24.0 / target
+        print(f"\n    target CR {target:g} ({budget:.4f} bpp)")
+        entries = {}
+        for name in args.criteria:
+            kept = select_by_score(scores[name], rates, budget)
+            psnr, bpp = measure(model, images, codes_cache, meter, kept)
+            entries[name] = {"channels": kept, "psnr_db": psnr, "bpp": bpp,
+                             "compression_ratio": 24.0 / bpp}
+            print(f"      {name:11s} keep {len(kept):2d}  {bpp:7.4f} bpp"
+                  f"  CR {24.0 / bpp:7.2f}  {psnr:6.2f} dB   {kept}")
+        prefix = [c for c in range(1, model.n_channels + 1)]
+        best_prefix = None
+        for n in range(1, model.n_channels + 1):
+            psnr, bpp = measure(model, images, codes_cache, meter, prefix[:n])
+            if bpp <= budget and (best_prefix is None or psnr > best_prefix["psnr_db"]):
+                best_prefix = {"channels": prefix[:n], "psnr_db": psnr, "bpp": bpp,
+                               "compression_ratio": 24.0 / bpp}
+        if best_prefix:
+            entries["prefix"] = best_prefix
+            print(f"      {'prefix':11s} keep {len(best_prefix['channels']):2d}  "
+                  f"{best_prefix['bpp']:7.4f} bpp  CR {best_prefix['compression_ratio']:7.2f}  "
+                  f"{best_prefix['psnr_db']:6.2f} dB")
+        if frontier:
+            fits = [point for point in frontier if point["bpp"] <= budget]
+            if fits:
+                best = max(fits, key=lambda point: point["psnr_db"])
+                entries["oracle"] = {"channels": best["channels"], "psnr_db": best["psnr_db"],
+                                     "bpp": best["bpp"],
+                                     "compression_ratio": 24.0 / best["bpp"]}
+                print(f"      {'oracle':11s} keep {len(best['channels']):2d}  {best['bpp']:7.4f} bpp"
+                      f"  CR {24.0 / best['bpp']:7.2f}  {best['psnr_db']:6.2f} dB   "
+                      f"{best['channels']}")
+        report["selections"][str(target)] = entries
+
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--checkpoint", type=Path, required=True)
@@ -95,41 +143,8 @@ def main() -> None:
         frontier = greedy_frontier(model, images, codes_cache, meter, verbose=True)
         report["oracle"] = frontier
 
-    print("\n  channel subsets selected at each target compression ratio:")
-    for target in args.target_compression:
-        budget = 24.0 / target
-        print(f"\n    target CR {target:g} ({budget:.4f} bpp)")
-        entries = {}
-        for name in args.criteria:
-            kept = select_by_score(scores[name], rates, budget)
-            psnr, bpp = measure(model, images, codes_cache, meter, kept)
-            entries[name] = {"channels": kept, "psnr_db": psnr, "bpp": bpp,
-                             "compression_ratio": 24.0 / bpp}
-            print(f"      {name:11s} keep {len(kept):2d}  {bpp:7.4f} bpp"
-                  f"  CR {24.0 / bpp:7.2f}  {psnr:6.2f} dB   {kept}")
-        prefix = [c for c in range(1, model.n_channels + 1)]
-        best_prefix = None
-        for n in range(1, model.n_channels + 1):
-            psnr, bpp = measure(model, images, codes_cache, meter, prefix[:n])
-            if bpp <= budget and (best_prefix is None or psnr > best_prefix["psnr_db"]):
-                best_prefix = {"channels": prefix[:n], "psnr_db": psnr, "bpp": bpp,
-                               "compression_ratio": 24.0 / bpp}
-        if best_prefix:
-            entries["prefix"] = best_prefix
-            print(f"      {'prefix':11s} keep {len(best_prefix['channels']):2d}  "
-                  f"{best_prefix['bpp']:7.4f} bpp  CR {best_prefix['compression_ratio']:7.2f}  "
-                  f"{best_prefix['psnr_db']:6.2f} dB")
-        if frontier:
-            fits = [point for point in frontier if point["bpp"] <= budget]
-            if fits:
-                best = max(fits, key=lambda point: point["psnr_db"])
-                entries["oracle"] = {"channels": best["channels"], "psnr_db": best["psnr_db"],
-                                     "bpp": best["bpp"],
-                                     "compression_ratio": 24.0 / best["bpp"]}
-                print(f"      {'oracle':11s} keep {len(best['channels']):2d}  {best['bpp']:7.4f} bpp"
-                      f"  CR {24.0 / best['bpp']:7.2f}  {best['psnr_db']:6.2f} dB   "
-                      f"{best['channels']}")
-        report["selections"][str(target)] = entries
+    select_at_targets(model, images, codes_cache, meter, rates,
+                      scores, frontier, args, report)
 
     if frontier:
         oracle_order = {}
