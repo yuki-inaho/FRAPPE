@@ -23,6 +23,7 @@ import io
 import math
 import random
 import time
+from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
@@ -38,6 +39,13 @@ from src.compressors.frappe.experiment import (
     atomic_torch_save,
 )
 from src.compressors.frappe.harness.data import default_dataset_root
+from src.compressors.frappe.harness.training import (
+    CropDataset,
+    PrefixSampler,
+    RateTarget,
+    continuation_stage,
+    seed_worker,
+)
 from src.compressors.frappe.prefix import (
     JointPrefixFRAPPE,
     calibrate_companders,
@@ -48,47 +56,6 @@ RELEASED_PS = [32, 32, 32, 16, 16, 16, 16, 16, 16, 8, 8, 8, 4, 4, 4, 4, 4, 4, 2,
 
 
 # ---- data --------------------------------------------------------------
-
-
-class CropDataset(torch.utils.data.Dataset):
-    """Random crops from an anonymous local ImageFolder split."""
-
-    def __init__(self, root: Path, split: str, crop: int, augment: bool = True,
-                 limit: int | None = None) -> None:
-        self.files = sorted((root / split).glob("image_????????.png"))
-        if limit:
-            self.files = self.files[:limit]
-        if not self.files:
-            raise SystemExit(f"no anonymous PNG images under {root / split}")
-        self.crop = crop
-        self.augment = augment
-
-    def __len__(self) -> int:
-        return len(self.files)
-
-    def __getitem__(self, index: int) -> torch.Tensor:
-        with Image.open(self.files[index]) as handle:
-            handle.load()
-            image = np.asarray(handle.convert("RGB"), dtype=np.uint8)
-        h, w = image.shape[:2]
-        size = self.crop
-        if h < size or w < size:
-            raise SystemExit(f"image {h}x{w} smaller than the requested {size} crop")
-        top = random.randint(0, h - size)
-        left = random.randint(0, w - size)
-        patch = image[top:top + size, left:left + size]
-        if self.augment:
-            if random.random() < 0.5:
-                patch = patch[:, ::-1]
-            if random.random() < 0.5:
-                patch = patch[::-1]
-        return torch.from_numpy(np.ascontiguousarray(patch)).permute(2, 0, 1)
-
-
-def seed_worker(_worker_id: int) -> None:
-    seed = torch.initial_seed() % (2 ** 32)
-    random.seed(seed)
-    np.random.seed(seed)
 
 
 def load_full_images(root: Path, split: str, count: int, device: str) -> torch.Tensor:
@@ -103,62 +70,6 @@ def load_full_images(root: Path, split: str, count: int, device: str) -> torch.T
 
 
 # ---- prefix sampling ---------------------------------------------------
-
-
-class PrefixSampler:
-    """Sandwich sampling over operating points spaced uniformly in log rate.
-
-    Symbol counts differ by 256x across the schedule, so sampling the channel
-    index uniformly would concentrate almost every sample on rates nobody uses.
-    Sampling uniformly in ``log C_n`` spreads the sampled operating points over
-    the rate axis instead.
-    """
-
-    def __init__(self, ps: list[int], extra: int = 1, seed: int = 0) -> None:
-        self.n_channels = len(ps)
-        symbols = np.cumsum([1.0 / (p * p) for p in ps])
-        self.log_symbols = np.log(symbols)
-        self.extra = extra
-        self.rng = random.Random(seed)
-
-    def sample(self, subset_prob: float = 0.0) -> list:
-        prefixes = {1, self.n_channels}
-        low, high = self.log_symbols[0], self.log_symbols[-1]
-        extra = []
-        for _ in range(self.extra):
-            target = self.rng.uniform(low, high)
-            n = int(np.abs(self.log_symbols - target).argmin()) + 1
-            if subset_prob and self.rng.random() < subset_prob:
-                # A random subset of the same size: pruning a codec to a
-                # non-prefix channel set only works if the decoder has seen
-                # non-prefix masks during training.
-                extra.append(sorted(self.rng.sample(range(1, self.n_channels + 1), n)))
-            else:
-                prefixes.add(n)
-        return sorted(prefixes) + extra
-
-
-def continuation_stage(progress: float, boundaries: list[float],
-                       alpha_range: tuple[float, float]) -> tuple[str, float, bool]:
-    """Map training progress onto (quantization mode, soft-round alpha, frozen encoder).
-
-    Stages are Q0 float, Q1 additive uniform noise, Q2 annealed soft rounding,
-    Q3 hard rounding with a straight-through estimator, and Q4 hard calibration
-    with the analysis path frozen so only the synthesis transform adapts.
-    """
-    q0, q1, q2, q3 = boundaries
-    if progress < q0:
-        return "float", 0.0, False
-    if progress < q1:
-        return "aun", 0.0, False
-    if progress < q2:
-        span = max(q2 - q1, 1e-6)
-        ratio = (progress - q1) / span
-        low, high = alpha_range
-        return "soft", float(low * (high / low) ** ratio), False
-    if progress < q3:
-        return "hard", 0.0, False
-    return "hard", 0.0, True
 
 
 # ---- evaluation --------------------------------------------------------
@@ -297,6 +208,176 @@ def parse_args(argv=None):
     return p.parse_args(argv)
 
 
+def build_model(args: argparse.Namespace, device: str) -> JointPrefixFRAPPE:
+    """Construct the model and give it a starting point worth optimising from.
+
+    The KLT initialiser puts the analysis filters at the stagewise linear optimum
+    instead of at noise, and the compander calibration sets each channel's code
+    range from measured percentiles rather than from a guess. Both cost one pass
+    over a handful of images and both are why the run does not spend its first
+    thousand steps rediscovering them.
+    """
+    model = JointPrefixFRAPPE(argparse.Namespace(**vars(args))).to(device)
+    calibration = load_full_images(args.dataset_root, "train", args.init_images, device)
+    if args.init == "klt":
+        print("initialising analysis filters from the deflated patch KLT", flush=True)
+        klt_initialize(model, calibration, verbose=True)
+    calibrate_companders(model, calibration, args.compander_percentile,
+                         args.compander_knee, args.compander_target)
+    del calibration
+    torch.cuda.empty_cache()
+    return model
+
+
+def build_optimizer(model: JointPrefixFRAPPE, args: argparse.Namespace
+                    ) -> tuple[list[torch.nn.Parameter], torch.optim.Optimizer]:
+    """Two parameter groups, because the two halves want different rates.
+
+    The analysis path is a handful of small convolutions and per-channel
+    companding scalars; the synthesis path is the bulk of the model. Returning
+    the analysis parameters as well is not incidental -- the last stage of the
+    quantization continuation freezes exactly them.
+    """
+    analysis_params = list(model.analysis.parameters()) + list(model.companders.parameters())
+    analysis_ids = {id(parameter) for parameter in analysis_params}
+    decoder_params = [parameter for parameter in model.parameters()
+                      if id(parameter) not in analysis_ids]
+    optimizer = torch.optim.AdamW([
+        {"params": analysis_params, "lr": args.lr * args.encoder_lr_scale},
+        {"params": decoder_params, "lr": args.lr},
+    ], weight_decay=args.weight_decay, betas=(0.9, 0.99))
+    return analysis_params, optimizer
+
+
+def build_loader(args: argparse.Namespace) -> torch.utils.data.DataLoader:
+    """Random crops, seeded so a run is reproducible from its --seed alone."""
+    generator = torch.Generator()
+    generator.manual_seed(args.seed)
+    return torch.utils.data.DataLoader(
+        CropDataset(args.dataset_root, "train", args.crop),
+        batch_size=args.batch_size, shuffle=True, drop_last=True,
+        num_workers=args.num_workers, pin_memory=True,
+        persistent_workers=args.num_workers > 0,
+        generator=generator, worker_init_fn=seed_worker)
+
+
+def prefix_loss(model: JointPrefixFRAPPE, x: torch.Tensor, points, mode: str,
+                alpha: float, autocast, args: argparse.Namespace, lam_rate: float,
+                device: str):
+    """The objective, for one batch, over the sampled operating points.
+
+    Distortion is ``log10 MSE`` per point rather than plain MSE. The prefixes in
+    one sample can differ in error by two orders of magnitude, and a sum of raw
+    MSEs would let the lowest-rate prefix own the gradient; the logarithm puts
+    them on one scale. It is also FRAPPE's own objective, so the comparison with
+    the stagewise trainer stays honest.
+
+    Returns the loss, the per-point distortions -- the monotonicity term needs
+    them and so does the console line -- and the full-prefix rate estimate, which
+    is what the dual ascent later compares against a real measurement.
+    """
+    with autocast:
+        reconstructions, codes = model.forward_operating_points(x, points, mode, alpha)
+    reconstructions = [reconstruction.float() for reconstruction in reconstructions]
+
+    weights = torch.tensor(
+        [args.full_prefix_weight if point == model.n_channels else 1.0
+         for point in points], device=device)
+    weights = weights / weights.sum()
+    distortions = [F.mse_loss(reconstruction, x).clamp_min(1e-12).log10()
+                   for reconstruction in reconstructions]
+    loss = sum(weight * distortion for weight, distortion in zip(weights, distortions))
+
+    rate_estimate = None
+    if lam_rate > 0:
+        rates = [model.rate_bpp(codes, point) for point in points]
+        rate_estimate = rates[-1] if points[-1] == model.n_channels else rates[0]
+        loss = loss + lam_rate * sum(w * rate for w, rate in zip(weights, rates))
+    if args.lam_distill > 0 and len(points) > 1:
+        teacher = reconstructions[-1].detach()
+        loss = loss + args.lam_distill * sum(
+            (reconstruction - teacher).abs().mean()
+            for reconstruction in reconstructions[:-1]) / (len(points) - 1)
+    if args.lam_mono > 0 and len(points) > 1:
+        # A longer prefix that reconstructs worse breaks the property the
+        # architecture exists for, so it is penalised rather than merely counted.
+        violations = [torch.relu(later - earlier + args.mono_margin)
+                      for earlier, later in zip(distortions[:-1], distortions[1:])]
+        loss = loss + args.lam_mono * sum(violations) / len(violations)
+    if args.lam_sat > 0:
+        loss = loss + args.lam_sat * model.saturation_penalty()
+    return loss, distortions, rate_estimate
+
+
+@dataclass
+class BestSoFar:
+    """The best checkpoint seen, and only from inside the rate budget.
+
+    Without the budget condition the headline number can come from an early
+    stage that had not yet been pushed down to the target bitrate. That is a
+    different operating point, not a better model.
+    """
+
+    psnr_db: float = float("-inf")
+    iteration: int | None = None
+    bpp: float | None = None
+
+
+def validation_checkpoint(model, ema, optimizer, validation, report_prefixes,
+                          args, iteration, started, tracker, kbest, rate_target,
+                          lam_rate, target_point, run_dir, best):
+    """Measure, price a bit, and write the checkpoints. Returns the new state.
+
+    Validation runs on the EMA weights when there are any, then puts the online
+    weights back: the smoothed model is what would be shipped, but it is not what
+    training continues from.
+    """
+    backup = None
+    if ema is not None:
+        backup = {name: value.detach().clone() for name, value in model.state_dict().items()}
+        ema.copy_to(model)
+
+    report = evaluate(model, validation, report_prefixes, args.rate_images)
+    full = report[model.n_channels]
+    for n, values in report.items():
+        tracker.scalar(f"validation/psnr/prefix_{n:02d}", values["psnr_db"], iteration)
+        tracker.scalar(f"validation/bpp/prefix_{n:02d}", values["bpp"], iteration)
+    print(f"  [{iteration}] validation  " + "  ".join(
+        f"n={n}:{v['psnr_db']:.2f}dB/{v['bpp']:.3f}bpp" for n, v in report.items()),
+        flush=True)
+
+    if rate_target is not None:
+        # Multiplicative dual ascent: over budget raises the price of a bit,
+        # under budget lowers it. Reported at every check so the trajectory of
+        # the multiplier is auditable rather than a hidden knob.
+        measured = report[target_point]["bpp"]
+        lam_rate = rate_target.update(lam_rate, measured)
+        print(f"  [{iteration}] rate target {args.target_bpp:.4f} bpp at "
+              f"n={target_point}: measured {measured:.4f} bpp -> lam_rate {lam_rate:.4f}",
+              flush=True)
+        tracker.scalar("validation/lam_rate", lam_rate, iteration)
+
+    payload = {"iteration": iteration, "model": model.state_dict(),
+               "optimizer": optimizer.state_dict(), "config": vars(args),
+               "report": report, "lam_rate": lam_rate,
+               "ema": ema.snapshot() if ema else None}
+    atomic_torch_save(payload, run_dir / "checkpoints" / "last.pth.tar")
+    within_budget = (args.target_bpp is None
+                     or report[target_point]["bpp"] <= args.target_bpp * 1.05)
+    if within_budget:
+        kbest.consider(full["psnr_db"], iteration, payload)
+        if full["psnr_db"] > best.psnr_db:
+            best = BestSoFar(full["psnr_db"], iteration, full["bpp"])
+    atomic_json_dump(
+        {"iteration": iteration, "elapsed_hours": (time.time() - started) / 3600,
+         "prefix_report": {str(key): value for key, value in report.items()}},
+        run_dir / "latest_report.json")
+
+    if backup is not None:
+        model.load_state_dict(backup)
+    return report, lam_rate, best
+
+
 def main(argv=None) -> None:
     args = parse_args(argv)
     started = time.time()
@@ -314,34 +395,11 @@ def main(argv=None) -> None:
     tracker = TensorBoardTracker(run_dir / "tensorboard", enabled=True)
     kbest = KBestCheckpointManager(run_dir / "checkpoints" / "best", k=args.keep_best_k, mode="max")
 
-    config = argparse.Namespace(**{k: v for k, v in vars(args).items()})
-    model = JointPrefixFRAPPE(config).to(device)
-
-    calibration = load_full_images(args.dataset_root, "train", args.init_images, device)
-    if args.init == "klt":
-        print("initialising analysis filters from the deflated patch KLT", flush=True)
-        klt_initialize(model, calibration, verbose=True)
-    calibrate_companders(model, calibration, args.compander_percentile,
-                         args.compander_knee, args.compander_target)
-    del calibration
-    torch.cuda.empty_cache()
+    model = build_model(args, device)
 
     validation = load_full_images(args.dataset_root, "validation", args.validation_images, device)
-    dataset = CropDataset(args.dataset_root, "train", args.crop)
-    generator = torch.Generator()
-    generator.manual_seed(args.seed)
-    loader = torch.utils.data.DataLoader(
-        dataset, batch_size=args.batch_size, shuffle=True, drop_last=True,
-        num_workers=args.num_workers, pin_memory=True, persistent_workers=args.num_workers > 0,
-        generator=generator, worker_init_fn=seed_worker)
-
-    analysis_params = list(model.analysis.parameters()) + list(model.companders.parameters())
-    analysis_ids = {id(p) for p in analysis_params}
-    decoder_params = [p for p in model.parameters() if id(p) not in analysis_ids]
-    optimizer = torch.optim.AdamW([
-        {"params": analysis_params, "lr": args.lr * args.encoder_lr_scale},
-        {"params": decoder_params, "lr": args.lr},
-    ], weight_decay=args.weight_decay, betas=(0.9, 0.99))
+    loader = build_loader(args)
+    analysis_params, optimizer = build_optimizer(model, args)
     base_lrs = [group["lr"] for group in optimizer.param_groups]
     ema = ModelEMA(model, args.ema_decay) if args.ema_decay > 0 else None
     sampler = PrefixSampler(args.ps, args.extra_prefixes, args.seed)
@@ -396,12 +454,13 @@ def main(argv=None) -> None:
     if args.target_bpp is not None and lam_rate <= 0:
         lam_rate = 0.05  # a starting point; dual ascent moves it within a few checks
     target_point = args.target_operating_point or model.n_channels
+    rate_target = (None if args.target_bpp is None
+                   else RateTarget(args.target_bpp, args.rate_dual_lr, args.lam_rate_max))
 
     model.train()
     iteration = start_iteration
     window: list[float] = []
-    best_psnr = float("-inf")
-    best_iteration, best_bpp = None, None
+    best = BestSoFar()
     frozen = False
     stream = iter(loader)
     while iteration < args.iterations:
@@ -427,32 +486,8 @@ def main(argv=None) -> None:
             group["lr"] = (args.min_lr + (base - args.min_lr) * cosine) * scale
 
         prefixes = sampler.sample(args.subset_prob)
-        with autocast:
-            reconstructions, codes = model.forward_operating_points(x, prefixes, mode, alpha)
-        reconstructions = [r.float() for r in reconstructions]
-
-        weights = torch.tensor(
-            [args.full_prefix_weight if point == model.n_channels else 1.0
-             for point in prefixes], device=device)
-        weights = weights / weights.sum()
-        distortions = [F.mse_loss(r, x).clamp_min(1e-12).log10() for r in reconstructions]
-        loss = sum(w * d for w, d in zip(weights, distortions))
-
-        rate_estimate = None
-        if lam_rate > 0:
-            rates = [model.rate_bpp(codes, point) for point in prefixes]
-            rate_estimate = rates[-1] if prefixes[-1] == model.n_channels else rates[0]
-            loss = loss + lam_rate * sum(w * r for w, r in zip(weights, rates))
-        if args.lam_distill > 0 and len(prefixes) > 1:
-            teacher = reconstructions[-1].detach()
-            loss = loss + args.lam_distill * sum(
-                (r - teacher).abs().mean() for r in reconstructions[:-1]) / (len(prefixes) - 1)
-        if args.lam_mono > 0 and len(prefixes) > 1:
-            violations = [torch.relu(b - a + args.mono_margin)
-                          for a, b in zip(distortions[:-1], distortions[1:])]
-            loss = loss + args.lam_mono * sum(violations) / len(violations)
-        if args.lam_sat > 0:
-            loss = loss + args.lam_sat * model.saturation_penalty()
+        loss, distortions, rate_estimate = prefix_loss(
+            model, x, prefixes, mode, alpha, autocast, args, lam_rate, device)
 
         optimizer.zero_grad(set_to_none=True)
         loss.backward()
@@ -486,58 +521,11 @@ def main(argv=None) -> None:
                   + f"  points={prefixes}", flush=True)
 
         if iteration % args.validate_every == 0 or iteration >= args.iterations:
-            if ema is not None:
-                backup = {k: v.detach().clone() for k, v in model.state_dict().items()}
-                ema.copy_to(model)
-            report = evaluate(model, validation, report_prefixes, args.rate_images)
+            report, lam_rate, best = validation_checkpoint(
+                model, ema, optimizer, validation, report_prefixes, args, iteration,
+                started, tracker, kbest, rate_target, lam_rate, target_point,
+                run_dir, best)
             full = report[model.n_channels]
-            for n, values in report.items():
-                tracker.scalar(f"validation/psnr/prefix_{n:02d}", values["psnr_db"], iteration)
-                tracker.scalar(f"validation/bpp/prefix_{n:02d}", values["bpp"], iteration)
-            print(f"  [{iteration}] validation  " + "  ".join(
-                f"n={n}:{v['psnr_db']:.2f}dB/{v['bpp']:.3f}bpp" for n, v in report.items()),
-                flush=True)
-            if args.target_bpp is not None:
-                measured = report[target_point]["bpp"]
-                # Multiplicative dual ascent: over budget raises the price of a
-                # bit, under budget lowers it.  Reported every check so the
-                # trajectory of the multiplier is auditable, not a hidden knob.
-                # The step is clipped so one check can change the price of a bit
-                # by at most a factor of e^0.7, which keeps the multiplier from
-                # slamming into its bounds on the first over-budget measurement.
-                step_size = float(np.clip(
-                    args.rate_dual_lr * (measured / args.target_bpp - 1.0), -0.7, 0.7))
-                lam_rate = float(np.clip(lam_rate * math.exp(step_size),
-                                         1e-6, args.lam_rate_max))
-                print(f"  [{iteration}] rate target {args.target_bpp:.4f} bpp at n={target_point}: "
-                      f"measured {measured:.4f} bpp -> lam_rate {lam_rate:.4f}", flush=True)
-                tracker.scalar("validation/lam_rate", lam_rate, iteration)
-            payload = {"iteration": iteration, "model": model.state_dict(),
-                       "optimizer": optimizer.state_dict(), "config": vars(args),
-                       "report": report, "lam_rate": lam_rate,
-                       "ema": ema.snapshot() if ema else None}
-            atomic_torch_save(payload, run_dir / "checkpoints" / "last.pth.tar")
-            # With a rate target, PSNR alone is not a ranking: a checkpoint that
-            # is over budget is not a better codec, it is a different one.  Only
-            # checkpoints inside the budget compete.
-            within_budget = (args.target_bpp is None
-                             or report[target_point]["bpp"] <= args.target_bpp * 1.05)
-            if within_budget:
-                kbest.consider(full["psnr_db"], iteration, payload)
-            atomic_json_dump(
-                {"iteration": iteration, "elapsed_hours": (time.time() - started) / 3600,
-                 "prefix_report": {str(k): v for k, v in report.items()}},
-                run_dir / "latest_report.json")
-            # Only checkpoints inside the rate budget are candidates for "best".
-            # Without this the headline number can come from an early stage that
-            # had not yet been pushed down to the target bitrate, which is a
-            # different operating point rather than a better model.
-            if within_budget and full["psnr_db"] > best_psnr:
-                best_psnr = full["psnr_db"]
-                best_iteration = iteration
-                best_bpp = full["bpp"]
-            if ema is not None:
-                model.load_state_dict(backup)
             # Stop only once the quantization continuation has finished: the
             # target must be met by a model that has actually been trained
             # through hard rounding, not by a float-stage model that happens to
@@ -550,6 +538,7 @@ def main(argv=None) -> None:
 
     tracker.close()
     total = time.time() - started
+    best_psnr, best_iteration, best_bpp = best.psnr_db, best.iteration, best.bpp
     budget = ("" if args.target_bpp is None
               else f" within the {args.target_bpp:.4f} bpp budget")
     detail = ("" if best_iteration is None
