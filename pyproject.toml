@@ -1,0 +1,78 @@
+# Tool configuration only. The environment itself is defined in pixi.toml; this
+# file exists so ruff, pytest and ty read one consistent set of rules rather
+# than each tool's defaults.
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+extend-exclude = ["docs", ".pixi", "FRAPPE.ipynb"]
+
+[tool.ruff.lint]
+select = [
+    "F",    # pyflakes: undefined names, unused imports - real defects
+    "E", "W",  # pycodestyle
+    "I",    # import ordering
+    "UP",   # pyupgrade
+    "B",    # bugbear: loop-variable capture, mutable defaults
+    "C4",   # comprehensions
+    "SIM",  # simplifications
+    "RUF",
+    "PL",   # pylint subset
+    "TRY",  # exception hygiene
+    "PTH",  # pathlib over os.path
+    "ARG",  # unused arguments
+]
+ignore = [
+    # The vendored quantizer and companding code uses the paper's own Greek
+    # names for its parameters, which is worth more than ASCII identifiers.
+    "PLC2401",
+    # Long messages inside raise statements read better inline than hoisted
+    # into a variable.
+    "TRY003", "EM101", "EM102",
+    # Magic values are the substance of a codec: 127 is the int8 range and 24 is
+    # uncompressed RGB, and naming every one of them hides more than it reveals.
+    "PLR2004",
+    # A tool's main() legitimately takes many arguments and branches.
+    "PLR0912", "PLR0913", "PLR0915", "PLR0917",
+    # Heavy optional dependencies - pillow_jpls, onnx, onnxruntime, onnxsim - are
+    # imported inside the functions that need them, so a tool that does not touch
+    # them does not pay to import them and does not fail if they are absent.
+    "PLC0415",
+    # jaxtyping shape annotations are strings by design: Int8[Tensor, "c h w"] is
+    # parsed by jaxtyping at runtime, not by Python's annotation grammar.
+    "F722",
+    # The vendored companding code uses the paper's Greek parameter names, and
+    # the docstrings use the multiplication sign for image sizes. Both are
+    # deliberate and both read better than their ASCII transliterations.
+    "RUF001", "RUF002", "RUF003",
+    # Several zips are intentionally truncating: a prefix walks fewer scale
+    # groups than the schedule has. Blanket strict= would change behaviour.
+    "B905",
+]
+
+[tool.ruff.lint.per-file-ignores]
+# The vendored optimiser is kept byte-close to its upstream so it can be
+# refreshed by re-copying; reformatting it would defeat that.
+"src/compressors/frappe/third_party/*" = ["ALL"]
+# The frozen paper scripts are reproduction artifacts, not maintained code.
+"train_rae_progressive.py" = ["E501", "E741", "PLR0912", "PLR0915", "B023"]
+"src/compressors/frappe/evaluate_encode_complexity.py" = ["B023"]
+# model.py and quantize.py carry gigatorch's own one-line class docstrings
+# verbatim so the vendored blocks can be refreshed by re-copying. Reflowing them
+# would make that diff unreadable for no gain.
+"src/compressors/frappe/model.py" = ["E501"]
+"src/compressors/frappe/quantize.py" = ["E501"]
+# Tests say what they mean at the cost of some repetition.
+"tests/*" = ["ARG001", "PLR2004", "TRY003"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["src", "tools"]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]
+addopts = "-q"
+
+[tool.ty.rules]
+# jaxtyping annotations are evaluated at runtime by beartype, not statically.
+unresolved-attribute = "warn"
