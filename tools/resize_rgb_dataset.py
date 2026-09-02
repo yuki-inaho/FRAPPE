@@ -16,7 +16,6 @@ from pathlib import Path
 
 from PIL import Image
 
-
 IMAGE_NAME = re.compile(r"image_[0-9]{8}\.png$")
 
 

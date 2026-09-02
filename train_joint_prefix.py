@@ -20,9 +20,7 @@ from __future__ import annotations
 
 import argparse
 import io
-import json
 import math
-import os
 import random
 import time
 from pathlib import Path
@@ -33,9 +31,18 @@ import torch.nn.functional as F
 from PIL import Image
 
 from src.compressors.frappe.experiment import (
-    KBestCheckpointManager, ModelEMA, TensorBoardTracker, atomic_json_dump, atomic_torch_save)
+    KBestCheckpointManager,
+    ModelEMA,
+    TensorBoardTracker,
+    atomic_json_dump,
+    atomic_torch_save,
+)
+from src.compressors.frappe.harness.data import default_dataset_root
 from src.compressors.frappe.prefix import (
-    QUANTIZATION_MODES, JointPrefixFRAPPE, calibrate_companders, klt_initialize)
+    JointPrefixFRAPPE,
+    calibrate_companders,
+    klt_initialize,
+)
 
 RELEASED_PS = [32, 32, 32, 16, 16, 16, 16, 16, 16, 8, 8, 8, 4, 4, 4, 4, 4, 4, 2, 2, 2]
 
@@ -220,8 +227,8 @@ def evaluate(model: JointPrefixFRAPPE, images: torch.Tensor, prefixes: list[int]
 def parse_args(argv=None):
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--device", default="cuda:0")
-    p.add_argument("--dataset_root", type=Path,
-                   default=Path("/workspace/data/frappe_rgb_800x608/imagefolder"))
+    p.add_argument("--dataset_root", type=Path, default=default_dataset_root(),
+                   help="anonymous ImageFolder root; defaults to $FRAPPE_DATASET_ROOT")
     p.add_argument("--run_dir", type=Path, required=True)
     p.add_argument("--ps", type=int, nargs="+", default=RELEASED_PS)
     p.add_argument("--input_channels", type=int, default=3)

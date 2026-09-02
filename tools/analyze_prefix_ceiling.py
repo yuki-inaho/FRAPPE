@@ -33,6 +33,7 @@ from __future__ import annotations
 
 import argparse
 import io
+import sys
 import json
 import time
 from pathlib import Path
@@ -42,6 +43,14 @@ import torch
 import torch.nn.functional as F
 from einops import rearrange
 from PIL import Image
+
+# Running ``python tools/<name>.py`` puts ``tools/`` on sys.path rather than the
+# repository root, so the documented invocation is made self-contained here.
+REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
+if str(REPOSITORY_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPOSITORY_ROOT))
+
+from src.compressors.frappe.harness.data import default_dataset_root  # noqa: E402
 
 DEFAULT_PS = [32, 32, 32, 16, 16, 16, 16, 16, 16, 8, 8, 8,
               4, 4, 4, 4, 4, 4, 2, 2, 2]
@@ -223,8 +232,8 @@ def free_pca_bound(fit: torch.Tensor, evaluate: torch.Tensor, ps_list: list[int]
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--dataset-root", type=Path,
-                        default=Path("/workspace/data/frappe_rgb_800x608/imagefolder"))
+    parser.add_argument("--dataset-root", type=Path, default=default_dataset_root(),
+                        help="anonymous ImageFolder root; defaults to $FRAPPE_DATASET_ROOT")
     parser.add_argument("--split", default="validation")
     parser.add_argument("--images", type=int, default=32)
     parser.add_argument("--fit-images", type=int, default=96,

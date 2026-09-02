@@ -20,7 +20,6 @@ measured file size, not by assuming a setting.
 from __future__ import annotations
 
 import argparse
-import io
 import json
 import math
 import sys
@@ -35,12 +34,15 @@ REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
 if str(REPOSITORY_ROOT) not in sys.path:
     sys.path.insert(0, str(REPOSITORY_ROOT))
 
-from tools.benchmark_reference_codecs import encode as encode_reference  # noqa: E402
-from tools.evaluate_joint_prefix import jpegls_bytes, load_checkpoint  # noqa: E402
-
-#: (low, high) quality-control bounds and whether higher means larger files.
-REFERENCE_BOUNDS = {"jpeg": (1, 100, True), "webp": (1, 100, True),
-                    "jpeg2000": (1, 400, False), "avif": (0, 63, False)}
+from src.compressors.frappe.harness import AnonymousImageFolder  # noqa: E402
+from src.compressors.frappe.harness.bitstream import measure_rate  # noqa: E402
+from src.compressors.frappe.harness.checkpoints import load_checkpoint  # noqa: E402
+from src.compressors.frappe.harness.cli import (  # noqa: E402
+    add_dataset_arguments,
+    add_device_argument,
+    resolve_device,
+)
+from src.compressors.frappe.harness.codecs import REFERENCE_BOUNDS, match_rate  # noqa: E402
 
 
 def to_image(tensor: torch.Tensor) -> Image.Image:
@@ -53,26 +55,6 @@ def psnr_between(reference: Image.Image, candidate: Image.Image) -> float:
     b = np.asarray(candidate, dtype=np.float32) / 255.0
     mse = float(((a - b) ** 2).mean())
     return float("inf") if mse <= 0 else -10.0 * math.log10(mse)
-
-
-def match_rate(image: Image.Image, codec: str, target_bytes: int,
-               steps: int = 12) -> tuple[Image.Image, int, int]:
-    """Bisect the codec's quality control until its file size matches ``target_bytes``."""
-    low, high, higher_is_larger = REFERENCE_BOUNDS[codec]
-    best = None
-    for _ in range(steps):
-        setting = (low + high) // 2
-        payload, decoded = encode_reference(image, codec, setting)
-        size = len(payload)
-        if best is None or abs(size - target_bytes) < abs(best[1] - target_bytes):
-            best = (decoded, size, setting)
-        if (size < target_bytes) == higher_is_larger:
-            low = setting + 1
-        else:
-            high = setting - 1
-        if low > high:
-            break
-    return best
 
 
 def label_strip(panels: list[tuple[str, Image.Image]], pad: int = 8,
@@ -93,9 +75,6 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--checkpoints", type=Path, nargs="+", required=True)
     parser.add_argument("--labels", nargs="+", default=None)
-    parser.add_argument("--dataset-root", type=Path,
-                        default=Path("/workspace/data/frappe_rgb_800x608/imagefolder"))
-    parser.add_argument("--split", default="validation")
     parser.add_argument("--index", type=int, default=0)
     parser.add_argument("--reference-codecs", nargs="+", default=["avif"],
                         choices=list(REFERENCE_BOUNDS))
@@ -104,23 +83,19 @@ def main() -> None:
                         help="crop for the detail strip; default is a centred quarter")
     parser.add_argument("--zoom-scale", type=int, default=2)
     parser.add_argument("--error-gain", type=float, default=8.0)
-    parser.add_argument("--device", default="cuda:0")
+    add_dataset_arguments(parser, images=None)
+    add_device_argument(parser)
     parser.add_argument("--output-dir", type=Path, required=True)
     args = parser.parse_args()
 
     labels = args.labels or [path.parent.parent.name for path in args.checkpoints]
     if len(labels) != len(args.checkpoints):
         raise SystemExit("--labels must have one entry per checkpoint")
-    device = args.device if torch.cuda.is_available() else "cpu"
+    device = resolve_device(args.device)
     args.output_dir.mkdir(parents=True, exist_ok=True)
 
-    files = sorted((args.dataset_root / args.split).glob("image_????????.png"))
-    if not files:
-        raise SystemExit(f"no anonymous PNG images under {args.dataset_root / args.split}")
-    path = files[args.index]
-    with Image.open(path) as handle:
-        handle.load()
-        original = handle.convert("RGB")
+    folder = AnonymousImageFolder(args.dataset_root, args.split)
+    original = folder.pil(args.index)
     array = np.array(original, dtype=np.uint8)
     x = (torch.from_numpy(array).permute(2, 0, 1).unsqueeze(0)
          .to(device=device, dtype=torch.float32) / 127.5 - 1.0)
@@ -132,12 +107,11 @@ def main() -> None:
               "size": list(original.size), "models": [], "references": []}
 
     for label, checkpoint in zip(labels, args.checkpoints):
-        model, config, state = load_checkpoint(checkpoint, device)
+        model = load_checkpoint(checkpoint, device).model
         codes = model.integer_codes(x)
         recon = model.decode(model.adapt([c.to(torch.float) for c in codes]),
                              model.n_channels).clamp(-1, 1)
-        payload_bytes = jpegls_bytes(codes, model.n_channels, model.scale_groups)
-        bpp = payload_bytes * 8 / pixels
+        payload_bytes, bpp = measure_rate(codes, pixels)
         image = to_image(recon[0])
         image.save(args.output_dir / f"{label}_reconstruction.png")
         error = (x - recon).abs().mean(1, keepdim=True) * args.error_gain

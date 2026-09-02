@@ -16,13 +16,13 @@ import re
 import stat
 import tarfile
 import zipfile
+from collections.abc import Iterable
 from contextlib import AbstractContextManager
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
-from typing import BinaryIO, Iterable
+from typing import BinaryIO
 
 from PIL import Image
-
 
 IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png", ".tif", ".tiff", ".bmp"}
 GENERATED_IMAGE = re.compile(r"^image_[0-9]{8}\.png$")
