@@ -18,3 +18,6 @@ FRAPPE is integrated in the compressors library:
 
 For packaging the INT8 encoder for an Intel NPU with a CUDA ONNX Runtime
 decoder, see [docs/NPU_INT8_ENCODER_CUDA_DECODER.md](docs/NPU_INT8_ENCODER_CUDA_DECODER.md).
+
+For the next rate-distortion and throughput target (CR 100, 30 dB and 200 fps),
+see [docs/CR100_30DB_200FPS_PLAN.md](docs/CR100_30DB_200FPS_PLAN.md).
