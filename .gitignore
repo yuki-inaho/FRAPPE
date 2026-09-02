@@ -8,4 +8,6 @@ runs/
 .private/
 index.md
 .venv/
-temp/session_extracts/
+# Working notes, workdocs and measurement dumps. They are session-local by
+# design, and some carry home paths or private dataset locations.
+temp/
