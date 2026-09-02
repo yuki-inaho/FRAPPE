@@ -40,7 +40,7 @@ def _encode_pillow(image: Image.Image, codec: str, setting: int) -> tuple[bytes,
         image.save(buffer, format="JPEG", quality=int(setting), subsampling=0,
                    optimize=True)
     elif codec == "webp":
-        image.save(buffer, format="WEBP", quality=int(setting), method=6)
+        image.save(buffer, format="WEBP", quality=int(setting), method=4)
     elif codec == "jpeg2000":
         # ``quality_mode="rates"`` reads quality_layers as compression ratios,
         # so the requested operating point is a compression ratio directly.
