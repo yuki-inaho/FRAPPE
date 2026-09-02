@@ -528,4 +528,49 @@ ffmpeg -hide_banner -i plane.jls -f rawvideo -pix_fmt gray - | cmp - plane.raw
 | 2026-09-02 | 10:58 JST | どちらも | ffmpeg 相互運用 (手順 19, SG-6) | ffmpeg (6.1.1) は実平面 0〜3 をバイト一致で復号。平面 4 (304×400, **173 B** とほぼ定数) は ffmpeg jpegls デコーダが「Error submitting packet」で復号不可 (強制指定でも同様)。合成実験で帰属確認: ほぼ定数ストリーム全般が ffmpeg で失敗 (CharLS 復号はバイト一致) → **ffmpeg 側の制限**と記録。パイプライン自体の正しさは roundtrip のバイト一致で担保済み |
 | 2026-09-02 | 10:59 JST | どちらも | 品質ゲートと私有検査 (手順 20, 21) | `pixi run test` 186+2 skip / `ruff check` / `ruff format --check` 全通。`git grep 2026_TW_TVA` は workdoc 自身のコマンド引用 2 件のみ (実データ混入なし)。未コミットは roundtrip の Table 修正のみ → コミット予定 |
 | 2026-09-02 | 11:00 JST | どちらも | 作業記録の完成 (手順 22) | 本表により §1.3 の全 Trace ID に証跡が対応。TR-1〜3: roundtrip JSON、TR-4: 参照検証 0 不一致、TR-5: `test_openvino_runtime.py`、TR-6: 検査ログ、TR-7: 両規約併記、TR-8: benchmark_devices.json、TR-9: cr40/cr50_report.json、TR-10: 本表の 10:30〜10:58 行 |
-| | | | | |
+| 2026-09-02 | 10:54 JST | どちらも | **CharLS ベースで確定** | エントロピー符号器は CharLS (pillow-jpls) で確定。encoder は CPU (bit-exact)、decoder は最速構成の GPU。NPU (2.6× 遅い + ramp + 形状固定) と JPEG XL e1 (3.2× 遅く 41% 大きい) は不採用。根拠は本表の実測行 |
+| 2026-09-02 | 11:05 JST | どちらも | YAGNI/KISS による整理 (ユーザー判断) | JXL 依存 (`pillow-jxl-plugin`) と NPU JPEG-LS オフロード (`jpegls_openvino.py` + テスト 27 件 + ベンチ 2 本) をリポジトリから削除。判定根拠は本表 (10:30〜10:55 行) と git 履歴 (`5a24353`, `91e4ec6`, `3ce38a6`) に保存。削除後スイート再確認: 全緑 (159 passed + 2 skipped) |
+| 2026-09-02 | 11:08 JST | どちらも | 論文と同等の処理フローを削除後ツリーで再確認 | CR-50: 27.527 dB / 0.49488 bpp / CR 48.50、CR-40: 28.575 dB / 0.61546 bpp / CR 39.00 — NPU decode 構成の 62 枚評価と同一値 (デバイスは速度のみを変えることを再確認)。§8 に最終構成として記載 |
+
+---
+
+## 8. 最終構成の決定 (CharLS ベース)
+
+2026-09-02 10:54 の意思決定 (ユーザー) を受けて、本作業の成果物を次の構成で確定する。
+
+| 段 | 採用 | 根拠となった実測 |
+| :--- | :--- | :--- |
+| 分析路 (encoder graph) | OpenVINO **CPU** + `INFERENCE_PRECISION_HINT=f32` (bit-exact) | 1.60-1.72 ms。GPU 15.4 ms / NPU 18.6 ms は 9-11 倍遅い |
+| エントロピー符号化 | **CharLS (pillow-jpls)**、payload-only 規約 | 1.85 ms / 29,030 B (0.690 b/sample)。JXL e1 は 3.2× 遅く 41% 大きい |
+| 復号 (decoder graph) | OpenVINO **GPU** (fp32) | 48.05 ms。CPU 121.6 ms / NPU 124.7 ms |
+| warm 総計 | **51.95 ms** (9.4 Mpx/s) | `benchmark_devices.json` |
+
+**不採用と根拠 (すべて実測):**
+
+* **NPU**: decode が GPU の 2.6 倍遅く、~15 回のウォームアップと形状固定コンパイルを要求。
+  JPEG-LS の NPU オフロードは front half だけで 146 ms (CharLS 全体 1.86 ms)。
+  さらに NPU コンパイラは比較演算を静かに誤計算する (`Convert(Greater)` 9345/9500、
+  `Select(Greater)` 1366/9500) ため、整数厳密性を要求する符号器に原理的に不向き。
+* **JPEG XL lossless e1**: 同じ平面で 3.2× 遅く 41% 大きい。e3 でも速度 7.2× でサイズ僅差。
+* 上記 2 点の実装とテストは YAGNI/KISS によりリポジトリから削除した。
+  判定の証跡は git 履歴 (`5a24353`, `91e4ec6`, `3ce38a6`) と本書 §7 に残る。
+
+**論文と同等の処理フロー (1 コマンド):**
+
+```bash
+set -a; source .private/local_paths.env; set +a
+export FRAPPE_ONNX_STEM=.private/onnx/frappe_cr50_16ch   # または frappe_cr40_17ch
+
+# encode -> JPEG-LS(CharLS) -> decode -> 再構成 PNG + PSNR/bpp/CR (両レート規約)
+pixi run python tools/roundtrip_openvino.py \
+  --onnx-stem "$FRAPPE_ONNX_STEM" \
+  --dataset-root "$FRAPPE_LOCAL_DATA_ROOT/imagefolder" \
+  --encoder-device CPU --decoder-device GPU --bit-exact \
+  --images 62 --report .private/out/paper_flow.json
+```
+
+* 62 枚評価 (CR-50): PSNR 27.729 dB / 0.47747 bpp / CR 50.265 (payload-only)、
+  0.47780 bpp / CR 50.231 (接頭辞込み)。既知の CR-50 点 (28.63 dB / CR 50.53) と
+  同一規約で比較可能。
+* 両動作点とも、decoder のデバイスを変えても PSNR/bpp は 1 ビットも変わらない
+  (10:44 行と 11:08 行の値が完全一致)。デバイスは速度だけを変える。
