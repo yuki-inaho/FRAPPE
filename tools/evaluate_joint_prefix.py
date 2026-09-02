@@ -11,6 +11,7 @@ the prefix property, which is the point of the architecture, has broken.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import sys
 from pathlib import Path
 
@@ -68,7 +69,9 @@ def main(argv: list[str] | None = None) -> None:
                   else BitstreamConvention.PAYLOAD_ONLY)
     print(checkpoint.describe(), flush=True)
 
-    report = {"checkpoint": str(args.checkpoint), "iteration": checkpoint.iteration,
+    report = {"checkpoint": str(args.checkpoint),
+              "checkpoint_sha256": hashlib.sha256(args.checkpoint.read_bytes()).hexdigest(),
+              "iteration": checkpoint.iteration,
               "ps": list(checkpoint.config.ps), "averaging": args.averaging,
               "count_length_prefix": args.count_length_prefix, "splits": {}}
     for split in args.splits:
@@ -88,7 +91,8 @@ def main(argv: list[str] | None = None) -> None:
         print(f"    monotonicity violations: {violations}/{max(len(curve) - 1, 0)}",
               flush=True)
         report["splits"][split] = {
-            "images": count, "curve": [point.as_dict() for point in curve],
+            "images": count, "image_indices": list(range(count)),
+            "curve": [point.as_dict() for point in curve],
             "final_psnr_db": curve[-1].psnr_db, "final_bpp": curve[-1].bpp,
             "final_compression_ratio": curve[-1].compression_ratio,
             "monotonicity_violations": violations,

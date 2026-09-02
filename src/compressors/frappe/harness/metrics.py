@@ -38,6 +38,8 @@ class RatePoint:
     psnr_db: float
     bpp: float
     images: int
+    bytes_total: int = 0
+    pixels_total: int = 0
 
     @property
     def compression_ratio(self) -> float:
@@ -46,7 +48,8 @@ class RatePoint:
 
     def as_dict(self) -> dict:
         return {"label": self.label, "psnr_db": self.psnr_db, "bpp": self.bpp,
-                "compression_ratio": self.compression_ratio, "images": self.images}
+                "compression_ratio": self.compression_ratio, "images": self.images,
+                "bytes_total": self.bytes_total, "pixels_total": self.pixels_total}
 
 
 @dataclass
@@ -88,4 +91,5 @@ class RateDistortionAccumulator:
         return self.bytes_total * 8 / self.pixels_total if self.pixels_total else float("nan")
 
     def point(self, label: str | int) -> RatePoint:
-        return RatePoint(label=label, psnr_db=self.psnr_db, bpp=self.bpp, images=self.images)
+        return RatePoint(label=label, psnr_db=self.psnr_db, bpp=self.bpp, images=self.images,
+                         bytes_total=self.bytes_total, pixels_total=self.pixels_total)
