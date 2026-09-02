@@ -16,9 +16,11 @@ import this module without it.
 from __future__ import annotations
 
 import hashlib
+from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+import numpy as np
 import torch
 
 from .bitstream import CODE_OFFSET
@@ -190,6 +192,145 @@ def export_encoder_onnx(quantized: torch.nn.Module, output_path: str | Path,
                       output_names=plane_names(quantized), dynamic_axes=axes,
                       opset_version=opset, dynamo=False)
     return {"path": str(output_path), "opset": opset}
+
+
+def encoder_weights_from_qat(qat_state: dict[str, Any]) -> dict[str, torch.Tensor]:
+    """The encoder's own weights from a QAT checkpoint, without hook state.
+
+    NNCF's hook parameters (``__nncf_hooks.*``) carry the *training-time*
+    quantization ranges, which the traceable projection does not reproduce;
+    deployment therefore quantizes the trained weights afresh, and only these
+    plain analysis/compander tensors travel over.
+    """
+    return {key: value for key, value in qat_state["state_dict"].items()
+            if not key.startswith("__nncf_hooks")}
+
+
+_COMPANDER_SCOPE_PATTERN = r".*/companders\..*"
+
+
+def require_disjoint_calibration_samples(
+    calibration_split: str,
+    calibration_indices: Sequence[int],
+    evaluation_split: str,
+    evaluation_indices: Sequence[int],
+) -> None:
+    """Reject calibration/evaluation leakage before reporting codec quality."""
+    if calibration_split != evaluation_split:
+        return
+    overlap = sorted(set(calibration_indices) & set(evaluation_indices))
+    if overlap:
+        preview = overlap[:8]
+        raise ValueError(
+            f"calibration and evaluation overlap in {calibration_split}: {preview}")
+
+
+def _remove_compander_output_qdq(model: Any) -> int:
+    """Remove Q/DQ pairs NNCF propagates across an ignored compander.
+
+    Ignoring every compander node prevents quantizers inside the nonlinear
+    mapping, but NNCF still places one Q/DQ pair at each ignored subgraph's
+    output. Those outputs are already FRAPPE's rounded integer codes. A second
+    learned quantization grid changes the bitstream, so reconnect consumers to
+    the rounded value and discard only those boundary pairs.
+    """
+    quantizers = [
+        node for node in model.graph.node
+        if node.op_type == "QuantizeLinear" and "/companders." in node.name
+    ]
+    removed_nodes = []
+    for quantizer in quantizers:
+        dequantizers = [
+            node for node in model.graph.node
+            if node.op_type == "DequantizeLinear" and node.input[0] == quantizer.output[0]
+        ]
+        if len(dequantizers) != 1:
+            raise ValueError(
+                f"expected one DequantizeLinear after {quantizer.name}, got {len(dequantizers)}")
+        dequantizer = dequantizers[0]
+        for consumer in model.graph.node:
+            for index, value in enumerate(consumer.input):
+                if value == dequantizer.output[0]:
+                    consumer.input[index] = quantizer.input[0]
+        for output in model.graph.output:
+            if output.name == dequantizer.output[0]:
+                output.name = quantizer.input[0]
+        removed_nodes.extend((quantizer, dequantizer))
+
+    for node in removed_nodes:
+        model.graph.node.remove(node)
+
+    used_inputs = {value for node in model.graph.node for value in node.input}
+    used_inputs.update(output.name for output in model.graph.output)
+    for initializer in list(model.graph.initializer):
+        if initializer.name not in used_inputs:
+            model.graph.initializer.remove(initializer)
+    return len(quantizers)
+
+
+def quantize_onnx_encoder(
+    input_path: str | Path,
+    output_path: str | Path,
+    calibration_images: Sequence[Mapping[str, np.ndarray]],
+    *,
+    target_device: str = "NPU",
+    subset_size: int | None = None,
+    preset: str = "performance",
+    bias_correction: str = "fast",
+) -> dict[str, Any]:
+    """PTQ an FP32 encoder ONNX and save the portable Q/DQ model.
+
+    ONNX is the durable quantization boundary: OpenVINO consumes this exact
+    artifact rather than repeating calibration inside its model backend.
+    Analysis convolutions are quantized while the companders, codec rounding,
+    clamp and uint8 plane layout remain ordinary floating-point/integer ops.
+    """
+    import nncf
+    import onnx
+
+    if not calibration_images:
+        raise ValueError("calibration_images must not be empty")
+    actual_subset = len(calibration_images) if subset_size is None else subset_size
+    if actual_subset <= 0 or actual_subset > len(calibration_images):
+        raise ValueError(
+            f"subset_size must be in [1, {len(calibration_images)}], got {actual_subset}")
+    if bias_correction not in {"fast", "accurate", "none"}:
+        raise ValueError(f"unsupported bias correction mode: {bias_correction}")
+
+    model = onnx.load(str(input_path))
+    advanced = nncf.AdvancedQuantizationParameters(
+        quantize_outputs=False,
+        disable_bias_correction=bias_correction == "none",
+    )
+    quantized = nncf.quantize(
+        model,
+        nncf.Dataset(list(calibration_images)),
+        subset_size=actual_subset,
+        target_device=nncf.TargetDevice(target_device.upper()),
+        preset=nncf.QuantizationPreset(preset.lower()),
+        fast_bias_correction=bias_correction != "accurate",
+        ignored_scope=nncf.IgnoredScope(patterns=[_COMPANDER_SCOPE_PATTERN]),
+        advanced_parameters=advanced,
+    )
+    removed = _remove_compander_output_qdq(quantized)
+    onnx.checker.check_model(quantized)
+
+    output_path = Path(output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    onnx.save(quantized, str(output_path))
+    op_types = [node.op_type for node in quantized.graph.node]
+    return {
+        "path": str(output_path),
+        "nncf_version": nncf.__version__,
+        "target_device": target_device.upper(),
+        "preset": preset.lower(),
+        "bias_correction": bias_correction,
+        "calibration_images": actual_subset,
+        "ignored_scope_patterns": [_COMPANDER_SCOPE_PATTERN],
+        "removed_compander_output_qdq": removed,
+        "quantize_linear": op_types.count("QuantizeLinear"),
+        "dequantize_linear": op_types.count("DequantizeLinear"),
+    }
 
 
 def sha256_of(path: str | Path) -> str:

@@ -190,3 +190,68 @@ def test_qat_export_keeps_quantization_nodes_and_dynamic_shapes(model, tmp_path)
         result = compiled({0: probe.numpy()})
         for index, want in enumerate(reference):
             assert (result[index] == want.numpy()).all()
+
+
+def test_onnx_ptq_is_saved_as_qdq_without_quantizing_companders(model, tmp_path):
+    """ONNX is the durable PTQ artifact; codec rounding stays outside Q/DQ."""
+    pytest.importorskip("nncf.onnx", reason="NNCF ships in the uv deploy group only")
+    import onnx
+    import openvino as ov
+
+    from src.compressors.frappe.harness.quantization import (
+        TrainableEncoder,
+        export_encoder_onnx,
+        quantize_onnx_encoder,
+    )
+
+    fp32_path = tmp_path / "fp32_encoder.onnx"
+    ptq_path = tmp_path / "ptq_encoder.onnx"
+    sample = torch.zeros(1, 3, 64, 64, dtype=torch.uint8)
+    export_encoder_onnx(TrainableEncoder(model), fp32_path, sample)
+    calibration = [
+        {"image": torch.randint(0, 256, sample.shape, dtype=torch.uint8).numpy()}
+        for _ in range(2)
+    ]
+
+    report = quantize_onnx_encoder(
+        fp32_path,
+        ptq_path,
+        calibration,
+        target_device="NPU",
+        subset_size=2,
+        preset="performance",
+        bias_correction="none",
+    )
+
+    quantized = onnx.load(str(ptq_path))
+    onnx.checker.check_model(quantized)
+    quantizers = [node for node in quantized.graph.node if node.op_type == "QuantizeLinear"]
+    weight_dequantizers = [
+        node for node in quantized.graph.node
+        if node.op_type == "DequantizeLinear" and "encoder.analysis" in node.name
+    ]
+    assert quantizers
+    assert len(quantizers) == 1  # the shared normalized image feeding all five convolutions
+    assert len(weight_dequantizers) == len(SCHEDULE)
+    assert all("/companders." not in node.name for node in quantizers)
+    assert report["removed_compander_output_qdq"] == len(SCHEDULE)
+    assert report["quantize_linear"] == len(quantizers)
+
+    ir = ov.Core().read_model(str(ptq_path))
+    assert ir.inputs[0].partial_shape.is_dynamic
+    assert sum(op.get_type_name() == "FakeQuantize" for op in ir.get_ops()) == 1
+    compiled = ov.Core().compile_model(ir, "CPU")
+    result = compiled({0: calibration[0]["image"]})
+    assert len(result) == len(SCHEDULE)
+    assert all(result[index].dtype.name == "uint8" for index in range(len(SCHEDULE)))
+
+
+def test_calibration_and_evaluation_samples_must_not_overlap():
+    from src.compressors.frappe.harness.quantization import (
+        require_disjoint_calibration_samples,
+    )
+
+    require_disjoint_calibration_samples("train", [0, 1], "validation", [0, 1])
+    require_disjoint_calibration_samples("validation", [0, 1], "validation", [2, 3])
+    with pytest.raises(ValueError, match="overlap"):
+        require_disjoint_calibration_samples("validation", [0, 1], "validation", [1, 2])

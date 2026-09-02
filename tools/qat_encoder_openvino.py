@@ -117,7 +117,16 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                           help="the same image indices are measured for every condition")
     evaluate.add_argument("--calibration-images", type=int, default=32,
                           help="training-split images for the PTQ condition's calibration")
+    evaluate.add_argument("--calibration-split", default="train",
+                          help="dataset split used only for PTQ statistics; "
+                               "must differ from --split")
     evaluate.add_argument("--target-device", default="NPU", choices=["NPU", "CPU", "ANY"])
+    evaluate.add_argument("--ptq-preset", default="performance",
+                          choices=["performance", "mixed"],
+                          help="NNCF ONNX activation/weight quantization preset")
+    evaluate.add_argument("--bias-correction", default="fast",
+                          choices=["fast", "accurate", "none"],
+                          help="NNCF ONNX PTQ bias-correction policy")
     evaluate.add_argument("--device", default="cuda:0",
                           help="torch device for the shared frozen decoder; CPU is allowed")
     evaluate.add_argument("--artifact-dir", type=Path, default=None,
@@ -388,10 +397,11 @@ def evaluate_command(args: argparse.Namespace) -> None:
 
     from src.compressors.frappe.harness.deployment import DecoderGraph
     from src.compressors.frappe.harness.quantization import (
-        DeployableEncoder,
         TrainableEncoder,
+        encoder_weights_from_qat,
         export_encoder_onnx,
-        restore_qat_state,
+        quantize_onnx_encoder,
+        require_disjoint_calibration_samples,
     )
 
     if args.device.startswith("cuda") and not torch.cuda.is_available():
@@ -402,6 +412,7 @@ def evaluate_command(args: argparse.Namespace) -> None:
     base_sha256 = sha256_of(args.base_checkpoint)
     dataset_root = args.dataset_root or default_dataset_root()
     folder = AnonymousImageFolder(dataset_root, args.split)
+    calibration_folder = AnonymousImageFolder(dataset_root, args.calibration_split)
     count = min(args.images, len(folder))
     if count < args.images:
         raise SystemExit(f"requested {args.images} images but the split has {len(folder)}")
@@ -409,38 +420,88 @@ def evaluate_command(args: argparse.Namespace) -> None:
     height, width = folder.pixels(0).shape[2], folder.pixels(0).shape[3]
     plan = prefix_channels(base_model.scale_groups, n_channels)
 
-    def deployable_ir(name: str, encoder_module: torch.nn.Module, artifacts: Path):
-        """Trace -> IR -> compiled CPU model, the exact deployment pipeline."""
-        onnx_path = artifacts / f"{name}_encoder.onnx"
-        export_encoder_onnx(encoder_module, onnx_path, torch.zeros(
-            1, base_model.input_channels, height, width, dtype=torch.uint8))
-        core = ov.Core()
-        return core.compile_model(core.read_model(str(onnx_path)), "CPU")
-
     artifacts = args.artifact_dir or args.output.parent
     artifacts.mkdir(parents=True, exist_ok=True)
     conditions: dict[str, dict] = {}
-    order = ["fp32", "ptq", "qat"]
+    order = ["fp32", "ptq", "ptq_qat_weights"]
 
-    encoder_modules: dict[str, torch.nn.Module] = {
-        "fp32": TrainableEncoder(base_model),
-        "ptq": quantize_encoder(
-            TrainableEncoder(base_model),
-            calibration_tensors(AnonymousImageFolder(dataset_root, "train"),
-                                args.calibration_images),
-            target_device=args.target_device, subset_size=args.calibration_images),
-    }
+    # NNCF 3.3's torch-side hook quantization does not survive tracing (the IR
+    # ignores the trained ranges), so the deployed graph quantizes the *trained
+    # weights* afresh with NNCF's ONNX backend. The saved Q/DQ ONNX is then the
+    # sole input to OpenVINO. Each condition gets its own model instance:
+    # loading QAT weights into a shared module would rewrite fp32 too.
+    base_weights = TrainableEncoder(load_checkpoint(args.base_checkpoint, "cpu").model.eval())
+    trained_weights = TrainableEncoder(load_checkpoint(args.base_checkpoint, "cpu").model.eval())
     payload = torch.load(args.qat_checkpoint, map_location="cpu", weights_only=False)
     if payload.get("base_checkpoint_sha256") != base_sha256:
         raise SystemExit("the QAT checkpoint was built from a different base checkpoint")
-    encoder_modules["qat"] = restore_qat_state(TrainableEncoder(base_model), payload)
+    trained_weights.load_state_dict(encoder_weights_from_qat(payload))
 
-    # export_encoder_onnx wraps the module in DeployableEncoder itself, so the
-    # encoder views are handed over raw: wrapping here as well would flatten
-    # the already-shaped planes a second time.
-    compiled: dict[str, object] = {}
-    for name in order:
-        compiled[name] = deployable_ir(name, encoder_modules[name], artifacts)
+    if args.calibration_images > len(calibration_folder):
+        raise SystemExit(
+            f"requested {args.calibration_images} calibration images but "
+            f"{args.calibration_split} has {len(calibration_folder)}")
+    calibration_indices = list(range(args.calibration_images))
+    try:
+        require_disjoint_calibration_samples(
+            args.calibration_split,
+            calibration_indices,
+            args.split,
+            list(range(count)),
+        )
+    except ValueError as error:
+        raise SystemExit(str(error)) from error
+    calibration = [{"image": calibration_folder.pixels(index).numpy()}
+                   for index in calibration_indices]
+    onnx_base = artifacts / "base_weights_encoder.onnx"
+    export_encoder_onnx(base_weights, onnx_base, torch.zeros(
+        1, base_model.input_channels, height, width, dtype=torch.uint8))
+    onnx_qat = artifacts / "qat_weights_encoder.onnx"
+    export_encoder_onnx(trained_weights, onnx_qat, torch.zeros(
+        1, base_model.input_channels, height, width, dtype=torch.uint8))
+
+    ptq_base_path = artifacts / "ptq_base_encoder.onnx"
+    ptq_base_info = quantize_onnx_encoder(
+        onnx_base,
+        ptq_base_path,
+        calibration,
+        target_device=args.target_device,
+        subset_size=args.calibration_images,
+        preset=args.ptq_preset,
+        bias_correction=args.bias_correction,
+    )
+    ptq_qat_path = artifacts / "ptq_qat_weights_encoder.onnx"
+    ptq_qat_info = quantize_onnx_encoder(
+        onnx_qat,
+        ptq_qat_path,
+        calibration,
+        target_device=args.target_device,
+        subset_size=args.calibration_images,
+        preset=args.ptq_preset,
+        bias_correction=args.bias_correction,
+    )
+
+    core = ov.Core()
+    deployment_onnx = {
+        "fp32": onnx_base,
+        "ptq": ptq_base_path,
+        "ptq_qat_weights": ptq_qat_path,
+    }
+    compiled = {}
+    ir_artifacts = {}
+    for name, onnx_path in deployment_onnx.items():
+        ir = core.read_model(str(onnx_path))
+        xml_path = artifacts / f"{name}_encoder.xml"
+        ov.save_model(ir, str(xml_path), compress_to_fp16=False)
+        persisted = core.read_model(str(xml_path))
+        compiled[name] = core.compile_model(persisted, "CPU")
+        ir_artifacts[name] = {
+            "xml": str(xml_path),
+            "bin": str(xml_path.with_suffix(".bin")),
+            "xml_sha256": sha256_of(xml_path),
+            "bin_sha256": sha256_of(xml_path.with_suffix(".bin")),
+            "ops": op_inventory(persisted.get_ops()),
+        }
 
     # Built after the calibration forwards: DecoderGraph wraps the shared
     # base model, so moving it to the decode device moves every encoder the
@@ -497,11 +558,31 @@ def evaluate_command(args: argparse.Namespace) -> None:
         "qat_iteration": payload.get("iteration"),
         "split": args.split, "images": count,
         "image_indices": list(range(count)),
+        "calibration": {
+            "split": args.calibration_split,
+            "images": len(calibration_indices),
+            "image_indices": calibration_indices,
+        },
         "size": [width, height],
         "prefix": n_channels, "averaging": "aggregate_mse",
         "bitstream_convention": "PAYLOAD_ONLY",
         "decoder": "torch DecoderGraph (frozen, fp32), identical for every condition",
         "openvino_runtime": ov.__version__,
+        "quantization": {
+            "backend": "NNCF ONNX PTQ",
+            "target_device": args.target_device,
+            "preset": args.ptq_preset,
+            "bias_correction": args.bias_correction,
+            "ptq_base": {**ptq_base_info, "sha256": sha256_of(ptq_base_path)},
+            "ptq_qat_weights": {**ptq_qat_info, "sha256": sha256_of(ptq_qat_path)},
+        },
+        "artifacts": {
+            "onnx": {
+                name: {"path": str(path), "sha256": sha256_of(path)}
+                for name, path in deployment_onnx.items()
+            },
+            "openvino_ir": ir_artifacts,
+        },
         "conditions": conditions,
         "deltas_vs_fp32": {
             name: {"d_psnr_db": conditions[name]["psnr_db"] - conditions["fp32"]["psnr_db"],
