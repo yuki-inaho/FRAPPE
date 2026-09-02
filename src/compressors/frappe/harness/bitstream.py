@@ -112,14 +112,26 @@ def prefix_channels(scale_groups: Sequence[tuple[int, int, int]],
     return kept
 
 
-def encode_plane(plane: UInt8[Tensor, "rows cols"]) -> bytes:
-    """The bare JPEG-LS stream for one arranged plane."""
-    import pillow_jpls  # noqa: F401 -- registers the JPEG-LS plugin with PIL
-    from PIL import Image
+def encode_plane(plane: UInt8[Tensor, "rows cols"], backend: str = "pillow") -> bytes:
+    """The bare JPEG-LS stream for one arranged plane, through the named backend.
 
-    buffer = io.BytesIO()
-    Image.fromarray(plane.numpy(), mode="L").save(buffer, format="JPEG-LS")
-    return buffer.getvalue()
+    ``pillow`` is the portable baseline (``pillow_jpls``). ``charls-native``
+    is an explicit opt-in that calls CharLS's C API through ctypes; when the
+    library is not loadable it raises rather than silently degrading to
+    Pillow, so a caller never gets a backend it did not name.
+    """
+    if backend == "pillow":
+        import pillow_jpls  # noqa: F401 -- registers the JPEG-LS plugin with PIL
+        from PIL import Image
+
+        buffer = io.BytesIO()
+        Image.fromarray(plane.numpy(), mode="L").save(buffer, format="JPEG-LS")
+        return buffer.getvalue()
+    if backend == "charls-native":
+        from .charls_native import encode_plane as native_encode
+
+        return native_encode(plane.numpy())
+    raise ValueError(f"unknown JPEG-LS backend {backend!r}; expected 'pillow' or 'charls-native'")
 
 
 def encode_planes(planes: Sequence[Tensor],

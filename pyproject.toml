@@ -47,7 +47,13 @@ deploy = [
     "openvino",
     "nncf",
     "onnx",
-    "onnxruntime",
+    "onnxruntime-gpu",
+    # onnxruntime-gpu 1.29 links CUDA 13, unlike torch's cu128 wheels, so the
+    # CUDA 13 userland lives beside torch's as pip packages; the hybrid runtime
+    # preloads it by absolute path (see docs/NPU_INT8_ENCODER_CUDA_DECODER.md).
+    # cuDNN stays at torch's 9.19 (cu12): the soname libcudnn.so.9 is shared.
+    "nvidia-cublas>=13",
+    "nvidia-cuda-runtime>=13",
     "onnxsim",
     "onnxscript",
     # NNCF's deployment strip (fake quantizers into native Q/DQ) builds on it.
